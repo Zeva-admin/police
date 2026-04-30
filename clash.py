@@ -13,7 +13,12 @@ from urllib.parse import quote
 import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 try:
     import clashapi  # required for dynamic IP setups
@@ -35,6 +40,9 @@ CLASH_PASSWORD: str = "My happy life43"
 # /clan #TAG, /members #TAG, /war #TAG, etc.
 CLAN_TAG: str = "#2GYQ8VJV2"
 
+# Who can use admin commands (like /reset). Set your Telegram user id here.
+OWNER_USER_ID: int = 7053001262
+
 # Target chat id for clan group notifications (set your group/supergroup id here).
 # Example: -1001234567890
 # If set to 0, bot uses the chat where you pressed "🔔 Уведомления".
@@ -52,6 +60,7 @@ _clash_token_source: str = "unset"  # "clashapi" | "unset"
 
 # Notification tasks per chat (group/supergroup)
 _notify_tasks: dict[int, asyncio.Task] = {}
+_notify_message_ids: dict[int, int] = {}
 SHUTDOWN_EVENT = asyncio.Event()
 
 # ============================================================
@@ -382,6 +391,19 @@ def clash_get(endpoint: str, retry_on_auth: bool = True) -> dict | None:
             logger.warning("Rate limited by Clash of Clans API. Endpoint: %s", endpoint)
             return {"_error": "rate_limit"}
 
+        # Maintenance / service unavailable
+        if response.status_code == 503:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+            reason = str(payload.get("reason", "") or "")
+            if reason == "inMaintenance":
+                logger.warning("Clash API maintenance mode (503). Endpoint: %s", endpoint)
+                return {"_error": "maintenance"}
+            logger.warning("Clash API service unavailable (503). Endpoint: %s", endpoint)
+            return {"_error": "service_unavailable"}
+
         # Handle not found
         if response.status_code == 404:
             logger.info("Resource not found: %s", endpoint)
@@ -474,6 +496,16 @@ def get_error_message(error_key: str) -> str:
             "🔌 <b>Нет соединения</b>\n"
             "Не удаётся подключиться к Clash API.\n"
             "Попробуй позже."
+        ),
+        "maintenance": (
+            "🛠 <b>Техработы</b>\n"
+            "Clash API сейчас на обслуживании.\n"
+            "Это не ошибка бота — попробуй позже."
+        ),
+        "service_unavailable": (
+            "⚠️ <b>Сервис недоступен</b>\n"
+            "Clash API временно недоступен.\n"
+            "Попробуй ещё раз через пару минут."
         ),
     }
     return messages.get(
@@ -587,7 +619,18 @@ def extract_tag_arg(text: str, default_tag: str | None = None) -> str | None:
     return tag
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def main_menu_keyboard(page: int = 1) -> InlineKeyboardMarkup:
+    if page == 2:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🔎 Поиск", callback_data="menu:find"),
+                    InlineKeyboardButton(text="🔗 Ссылка клана", callback_data="menu:link"),
+                ],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:back")],
+            ]
+        )
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -610,6 +653,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📜 Журнал войн", callback_data="menu:warlog"),
                 InlineKeyboardButton(text="🏚️ Столица", callback_data="menu:capital"),
             ],
+            [InlineKeyboardButton(text="➕ Ещё", callback_data="menu:more")],
         ]
     )
 
@@ -620,7 +664,7 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def members_pager_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+def members_pager_keyboard(page: int, total_pages: int, chunk: list[dict]) -> InlineKeyboardMarkup:
     nav_row: list[InlineKeyboardButton] = []
     if page > 1:
         nav_row.append(
@@ -635,6 +679,25 @@ def members_pager_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
     keyboard: list[list[InlineKeyboardButton]] = []
     if nav_row:
         keyboard.append(nav_row)
+
+    # Member quick buttons (open profile)
+    if chunk:
+        row: list[InlineKeyboardButton] = []
+        for idx, m in enumerate(chunk, start=1):
+            tag = _norm_tag(m.get("tag")).lstrip("#")
+            row.append(
+                InlineKeyboardButton(
+                    text=str(idx),
+                    callback_data=f"menu:member:{page}:{tag}",
+                )
+            )
+            if len(row) == 5:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton(text="🔎 Поиск", callback_data="menu:find")])
     keyboard.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -670,8 +733,19 @@ async def _edit_or_send(message: Message, text: str, reply_markup: InlineKeyboar
         )
 
 
+async def _api(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 def _safe(s: object) -> str:
     return html.escape(str(s)) if s is not None else ""
+
+
+def _is_owner(message: Message) -> bool:
+    try:
+        return bool(message.from_user) and int(message.from_user.id) == int(OWNER_USER_ID)
+    except Exception:
+        return False
 
 
 def _normalize_state_label(state: str) -> str:
@@ -724,6 +798,18 @@ def _time_left(end_ts: str | None) -> str:
     return " ".join(parts)
 
 
+def build_home_text() -> str:
+    chat_target = (
+        f"<code>{CHAT_ID}</code>" if isinstance(CHAT_ID, int) and CHAT_ID != 0 else "<i>не задан (берётся чат, где нажали кнопку)</i>"
+    )
+    return (
+        "Меню клана:\n"
+        f"⧉ <code>{_safe(CLAN_TAG)}</code>\n\n"
+        f"Уведомления в чат: {chat_target}\n\n"
+        "<i>/player #ТЕГ • /find ник • /chatid • /reset</i>"
+    )
+
+
 def build_clan_text(data: dict) -> str:
     name = _safe(data.get("name", "—"))
     tag = _safe(data.get("tag", "—"))
@@ -759,37 +845,29 @@ def build_clan_text(data: dict) -> str:
 
     desc_block = f"\n\n📝 <b>Описание:</b>\n<i>{description[:300] or '—'}</i>" if description else ""
 
+    url = clan_profile_url(tag)
     return (
-        "🏰 <b>Клан</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🏛 <b>Название:</b> {name}\n"
-        f"🏷 <b>Тег:</b> <code>{tag}</code>\n"
-        f"⭐ <b>Уровень:</b> {level}\n"
-        f"📍 <b>Локация:</b> {location}\n"
-        f"🔐 <b>Тип:</b> {clan_type}\n"
+        f"🏰 <b>{name}</b>\n"
+        f"⧉ <code>{tag}</code>\n\n"
+        f"⭐ Уровень: <b>{level}</b> • {location}\n"
+        f"🔐 Тип: {clan_type}\n"
         f"{desc_block}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 <b>Участники:</b> {member_count}/50\n"
-        f"🏆 <b>Очки клана:</b> {clan_points}\n"
-        f"🔨 <b>Очки строителя:</b> {builder_points}\n"
-        f"🥇 <b>Мин. трофеи:</b> {required_trophies}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚔️ <b>Частота войн:</b> {war_frequency}\n"
-        f"📜 <b>Журнал войн:</b> {war_log_status}\n"
-        f"✅ <b>Победы:</b> {war_wins}\n"
-        f"🤝 <b>Ничьи:</b> {war_ties}\n"
-        f"❌ <b>Поражения:</b> {war_losses}"
+        f"👥 Участники: <b>{member_count}/50</b>\n"
+        f"🏆 Очки: <b>{clan_points}</b> • 🔨 Строитель: <b>{builder_points}</b>\n"
+        f"🥇 Вход: <b>{required_trophies}</b>\n\n"
+        f"⚔️ Войны: <b>{war_frequency}</b> • 📜 Журнал: <b>{war_log_status}</b>\n"
+        f"✅ {war_wins} • 🤝 {war_ties} • ❌ {war_losses}\n\n"
+        f"🔗 {url}"
     )
 
 
-def build_members_text(members: list[dict], page: int, per_page: int) -> tuple[str, int]:
+def build_members_text(members: list[dict], page: int, per_page: int) -> tuple[str, int, list[dict]]:
     total = len(members)
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
 
     start = (page - 1) * per_page
     end = min(start + per_page, total)
-    chunk = members[start:end]
 
     role_order = {"leader": 0, "coLeader": 1, "admin": 2, "elder": 2, "member": 3}
     members_sorted = sorted(
@@ -809,25 +887,41 @@ def build_members_text(members: list[dict], page: int, per_page: int) -> tuple[s
         th = member.get("townHallLevel", "?")
         trophies = format_number(member.get("trophies"))
 
-        league_name = _safe((member.get("league") or {}).get("name", "—"))
-        league_tier = _safe((member.get("leagueTier") or {}).get("name", ""))
-        league_line = f"🏅 {league_name}" if league_name else "🏅 —"
-        if league_tier:
-            league_line += f" • 🎖 {league_tier}"
+        trophy_league = _safe((member.get("league") or {}).get("name", "—"))
+        ranked_league = _safe((member.get("leagueTier") or {}).get("name", "—"))
+        builder_league = _safe((member.get("builderBaseLeague") or {}).get("name", ""))
+
+        # New ranked system (leagueTier) is shown first
+        league_parts = [f"⚡ {ranked_league}", f"🏅 {trophy_league}"]
+        if builder_league:
+            league_parts.append(f"🔨 {builder_league}")
+        league_line = " • ".join(league_parts)
+
+        clan_rank = member.get("clanRank")
+        prev_rank = member.get("previousClanRank")
+        try:
+            r = int(clan_rank) if clan_rank is not None else idx
+        except Exception:
+            r = idx
+        try:
+            p = int(prev_rank) if prev_rank is not None else r
+        except Exception:
+            p = r
+        delta = p - r
+        trend = f" ▲{delta}" if delta > 0 else (f" ▼{abs(delta)}" if delta < 0 else "")
 
         lines.append(
-            f"{idx:>2}. {role_emoji} <b>{name}</b> <code>{tag}</code>\n"
+            f"{r:>2}{trend}. {role_emoji} <b>{name}</b> <code>{tag}</code>\n"
             f"    🏰 TH{th} • 🏆 {trophies} • {league_line}"
         )
 
     header = (
-        "👥 <b>Участники клана</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Клан: <code>{_safe(CLAN_TAG)}</code>\n"
-        f"Всего: <b>{total}</b>\n\n"
+        f"👥 <b>Участники</b> • всего <b>{total}</b>\n"
+        f"⧉ <code>{_safe(CLAN_TAG)}</code>\n\n"
+        "<i>Цифра под списком откроет профиль.</i>\n\n"
     )
     body = "\n\n".join(lines) if lines else "<i>Участников не найдено.</i>"
-    return header + body, total_pages
+    return header + body, total_pages, chunk
 
 
 def build_war_text(data: dict) -> str:
@@ -857,13 +951,10 @@ def build_war_text(data: dict) -> str:
     prep = _format_time_utc(data.get("preparationStartTime"))
     start = _format_time_utc(data.get("startTime"))
     end = _format_time_utc(data.get("endTime"))
+    left = _time_left(data.get("endTime"))
 
     if state == "notInWar":
-        return (
-            "😴 <b>Война</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Сейчас клан <b>не участвует</b> в войне."
-        )
+        return "😴 Сейчас войны нет."
 
     our_members = our.get("members", []) or []
     opp_members = opp.get("members", []) or []
@@ -928,14 +1019,12 @@ def build_war_text(data: dict) -> str:
         )
 
     return (
-        "⚔️ <b>Война кланов</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚔️ <b>Война</b>\n\n"
+        f"⧉ <code>{_safe(CLAN_TAG)}</code>\n"
         f"Статус: <b>{_safe(_normalize_state_label(state))}</b>\n"
         f"Формат: <b>{team_size}×{team_size}</b> • атак на участника: <b>{attacks_per_member}</b>\n"
-        f"🕐 Подготовка: <code>{_safe(prep)}</code>\n"
-        f"🚩 Начало: <code>{_safe(start)}</code>\n"
-        f"🏁 Конец: <code>{_safe(end)}</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏁 Конец: <code>{_safe(end)}</code>\n"
+        f"⏳ Осталось: <b>{_safe(left)}</b>\n\n"
         f"🏰 <b>{our_name}</b>: ⭐ <b>{our_stars}</b> • 💥 <b>{our_destr:.2f}%</b>\n"
         f"🟥 <b>{opp_name}</b>: ⭐ <b>{opp_stars}</b> • 💥 <b>{opp_destr:.2f}%</b>"
         f"{left_line}"
@@ -956,13 +1045,14 @@ def build_leaders_text(members: list[dict]) -> str:
         name = _safe(m.get("name", "—"))
         tag = _safe(m.get("tag", ""))
         th = m.get("townHallLevel", "?")
-        league = _safe((m.get("league") or {}).get("name", "—"))
+        trophy_league = _safe((m.get("league") or {}).get("name", "—"))
+        ranked_league = _safe((m.get("leagueTier") or {}).get("name", "—"))
         role = m.get("role", "member")
         role_emoji = get_role_emoji(role)
         role_label = get_role_label(role)
         lines.append(
             f"{role_emoji} <b>{role_label}:</b> <b>{name}</b> <code>{tag}</code>\n"
-            f"    🏰 TH{th} • 🏅 {league}"
+            f"    🏰 TH{th} • ⚡ {ranked_league} • 🏅 {trophy_league}"
         )
 
     body = "\n\n".join(lines) if lines else "<i>Нет данных.</i>"
@@ -1076,6 +1166,102 @@ def build_capital_text(data: dict) -> str:
     )
 
 
+def clan_profile_url(clan_tag: str) -> str:
+    tag = _norm_tag(clan_tag).lstrip("#")
+    return f"https://link.clashofclans.com/en?action=OpenClanProfile&tag={tag}"
+
+
+def player_profile_url(player_tag: str) -> str:
+    tag = _norm_tag(player_tag).lstrip("#")
+    return f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={tag}"
+
+
+def search_members(members: list[dict], query: str) -> list[dict]:
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    res: list[dict] = []
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        name = str(m.get("name", "")).lower()
+        tag = str(m.get("tag", "")).lower()
+        if q in name or q in tag:
+            res.append(m)
+    return res
+
+
+def build_player_text(data: dict) -> str:
+    name = _safe(data.get("name", "—"))
+    tag = _safe(data.get("tag", "—"))
+    th_level = data.get("townHallLevel", "—")
+    bh_level = data.get("builderHallLevel", "—")
+    exp_level = data.get("expLevel", "—")
+    trophies = format_number(data.get("trophies"))
+    best_trophies = format_number(data.get("bestTrophies"))
+    war_stars = format_number(data.get("warStars"))
+    attack_wins = format_number(data.get("attackWins"))
+    defense_wins = format_number(data.get("defenseWins"))
+    donations = format_number(data.get("donations"))
+    donations_received = format_number(data.get("donationsReceived"))
+    trophy_league = _safe(data.get("league", {}).get("name", "Без лиги"))
+    ranked_league = _safe((data.get("leagueTier") or {}).get("name", "—"))
+    league_group_tag = _safe(data.get("currentLeagueGroupTag", ""))
+    league_season_id = data.get("currentLeagueSeasonId")
+    league_season = _safe(league_season_id) if league_season_id is not None else ""
+
+    clan_data = data.get("clan", {}) or {}
+    clan_name = _safe(clan_data.get("name", "Нет клана"))
+    clan_tag = _safe(clan_data.get("tag", ""))
+
+    role = data.get("role", "member")
+    role_label = get_role_label(role)
+    role_emoji = get_role_emoji(role)
+
+    def th_emoji(level: int | str) -> str:
+        try:
+            lvl = int(level)
+            return "🏰" if lvl >= 12 else "🏠"
+        except (ValueError, TypeError):
+            return "🏠"
+
+    link = player_profile_url(tag)
+
+    text = (
+        f"👤 <b>Профиль игрока</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎮 <b>Ник:</b> {name}\n"
+        f"⧉ <b>Тег:</b> <code>{tag}</code>\n"
+        f"📊 <b>Уровень:</b> {exp_level}\n"
+        f"⚡ <b>Ранг:</b> {ranked_league}\n"
+        f"🏅 <b>Трофейная лига:</b> {trophy_league}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{th_emoji(th_level)} <b>ТХ:</b> {th_level}\n"
+        f"🔨 <b>БХ:</b> {bh_level}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 <b>Трофеи:</b> {trophies}\n"
+        f"🥇 <b>Лучшие:</b> {best_trophies}\n"
+        f"⭐ <b>Звёзды войны:</b> {war_stars}\n"
+        f"⚔️ <b>Победы атаки:</b> {attack_wins}\n"
+        f"🛡 <b>Победы защиты:</b> {defense_wins}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎁 <b>Отдал:</b> {donations}\n"
+        f"📥 <b>Получил:</b> {donations_received}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏰 <b>Клан:</b> {clan_name}"
+    )
+    if clan_tag:
+        text += f" <code>{clan_tag}</code>"
+    text += f"\n{role_emoji} <b>Роль:</b> {role_label}\n\n🔗 {link}"
+    if league_group_tag or league_season:
+        text += "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+        if league_group_tag:
+            text += f"⧉ <b>Группа ранга:</b> <code>{league_group_tag}</code>\n"
+        if league_season:
+            text += f"⧉ <b>Сезон ранга:</b> <code>{league_season}</code>"
+    return text
+
+
 def _norm_tag(tag: str | None) -> str:
     if not tag:
         return ""
@@ -1109,7 +1295,7 @@ def find_our_war_in_round(round_data: dict, clan_tag: str) -> tuple[str | None, 
         if not isinstance(wt, str) or wt == "#0":
             continue
         war = get_cwl_war(wt)
-        if not isinstance(war, dict):
+        if not isinstance(war, dict) or war.get("_error"):
             continue
         ctag = _norm_tag((war.get("clan") or {}).get("tag"))
         otag = _norm_tag((war.get("opponent") or {}).get("tag"))
@@ -1124,7 +1310,7 @@ def get_current_cwl_war_for_clan() -> tuple[str | None, dict | None]:
     Returns (war_tag, war_data) or (None, None).
     """
     group = get_cwl_group()
-    if not isinstance(group, dict) or group.get("_error") == "not_found":
+    if not isinstance(group, dict) or group.get("_error"):
         return None, None
 
     rounds = group.get("rounds", []) or []
@@ -1207,12 +1393,12 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
             context = ""
 
             cwl_tag, cwl_war = await asyncio.to_thread(get_current_cwl_war_for_clan)
-            if cwl_tag and isinstance(cwl_war, dict):
+            if cwl_tag and isinstance(cwl_war, dict) and not cwl_war.get("_error"):
                 context = "ЛВК"
                 title, missing, state, end_time = get_war_missing_attacks(cwl_war, CLAN_TAG)
             else:
                 war = await asyncio.to_thread(get_current_war, CLAN_TAG)
-                if isinstance(war, dict) and war.get("_error") not in {"not_found"}:
+                if isinstance(war, dict) and not war.get("_error"):
                     context = "КВ"
                     title, missing, state, end_time = get_war_missing_attacks(war, CLAN_TAG)
 
@@ -1226,16 +1412,15 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
                 continue
 
             time_left = _time_left(end_time)
-            header = (
-                f"🔔 <b>{context}: сделайте атаки!</b>\n"
-                f"Осталось: <b>{_safe(time_left)}</b>\n\n"
-                "Не атаковали:\n"
+            title = f"🔔 <b>{context}</b> — атаки"
+            body = ", ".join(_safe(line.split("</b>")[0].split("<b>")[-1]) for line in missing[:20])
+            if len(missing) > 20:
+                body += f" …и ещё {len(missing) - 20}"
+            text = (
+                f"{title}\n"
+                f"Осталось: <b>{_safe(time_left)}</b>\n"
+                f"Не атаковали ({len(missing)}): {body}"
             )
-            body = "\n".join(missing[:30])
-            if len(missing) > 30:
-                body += f"\n…и ещё <b>{len(missing) - 30}</b>"
-
-            text = header + body
             fingerprint = f"{context}|{state}|{end_time}|{';'.join(missing)}"
 
             now = time.time()
@@ -1246,7 +1431,25 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
                 should_send = True
 
             if should_send:
-                await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                msg_id = _notify_message_ids.get(chat_id)
+                if msg_id:
+                    try:
+                        await bot.edit_message_text(
+                            text,
+                            chat_id=chat_id,
+                            message_id=msg_id,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception:
+                        msg_id = None
+
+                if not msg_id:
+                    sent = await bot.send_message(
+                        chat_id, text, parse_mode="HTML", disable_web_page_preview=True
+                    )
+                    _notify_message_ids[chat_id] = sent.message_id
+
                 last_fingerprint = fingerprint
                 last_sent_at = now
 
@@ -1307,19 +1510,25 @@ async def cb_noop(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:home")
 async def cb_home(query: CallbackQuery) -> None:
     await query.answer()
-    text = (
-        "🏰 <b>Клан-бот Clash of Clans</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Клан по умолчанию: <code>{CLAN_TAG}</code>\n\n"
-        "Выбери раздел кнопками ниже."
-    )
-    await _edit_or_send(query.message, text, main_menu_keyboard())
+    await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(1))
+
+
+@router_dp.callback_query(F.data == "menu:more")
+async def cb_more(query: CallbackQuery) -> None:
+    await query.answer()
+    await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(2))
+
+
+@router_dp.callback_query(F.data == "menu:back")
+async def cb_back(query: CallbackQuery) -> None:
+    await query.answer()
+    await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(1))
 
 
 @router_dp.callback_query(F.data == "menu:clan")
 async def cb_clan(query: CallbackQuery) -> None:
     await query.answer()
-    data = get_clan_info(CLAN_TAG)
+    data = await _api(get_clan_info, CLAN_TAG)
     err = check_api_error(data, context="clan info (menu)")
     if err:
         await _edit_or_send(query.message, err, back_to_menu_keyboard())
@@ -1337,21 +1546,21 @@ async def cb_members(query: CallbackQuery) -> None:
     except Exception:
         page = 1
 
-    data = get_clan_members(CLAN_TAG)
+    data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="clan members (menu)")
     if err:
         await _edit_or_send(query.message, err, back_to_menu_keyboard())
         return
 
     members: list[dict] = data.get("items", [])
-    text, total_pages = build_members_text(members, page=page, per_page=10)
-    await _edit_or_send(query.message, text, members_pager_keyboard(page, total_pages))
+    text, total_pages, chunk = build_members_text(members, page=page, per_page=10)
+    await _edit_or_send(query.message, text, members_pager_keyboard(page, total_pages, chunk))
 
 
 @router_dp.callback_query(F.data == "menu:war")
 async def cb_war(query: CallbackQuery) -> None:
     await query.answer()
-    data = get_current_war(CLAN_TAG)
+    data = await _api(get_current_war, CLAN_TAG)
     err = check_api_error(data, context="current war (menu)")
     if err:
         await _edit_or_send(query.message, err, back_to_menu_keyboard())
@@ -1364,7 +1573,7 @@ async def cb_war(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:top")
 async def cb_top(query: CallbackQuery) -> None:
     await query.answer()
-    data = get_clan_members(CLAN_TAG)
+    data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="top members (menu)")
     if err:
         await _edit_or_send(query.message, err, back_to_menu_keyboard())
@@ -1390,10 +1599,11 @@ async def cb_top(query: CallbackQuery) -> None:
         tag = _safe(m.get("tag", ""))
         th = m.get("townHallLevel", "?")
         trophies = format_number(m.get("trophies"))
-        league = _safe((m.get("league") or {}).get("name", "—"))
+        trophy_league = _safe((m.get("league") or {}).get("name", "—"))
+        ranked_league = _safe((m.get("leagueTier") or {}).get("name", "—"))
         lines.append(
             f"{medal} <b>{name}</b> <code>{tag}</code>\n"
-            f"    🏰 TH{th} • 🏆 <b>{trophies}</b> • 🏅 {league}"
+            f"    🏰 TH{th} • 🏆 <b>{trophies}</b> • ⚡ {ranked_league} • 🏅 {trophy_league}"
         )
 
     text = (
@@ -1407,7 +1617,7 @@ async def cb_top(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:donations")
 async def cb_donations(query: CallbackQuery) -> None:
     await query.answer()
-    data = get_clan_members(CLAN_TAG)
+    data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="donations (menu)")
     if err:
         await _edit_or_send(query.message, err, back_to_menu_keyboard())
@@ -1447,10 +1657,94 @@ async def cb_donations(query: CallbackQuery) -> None:
     await _edit_or_send(query.message, text, main_menu_keyboard())
 
 
+@router_dp.callback_query(F.data.startswith("menu:member:"))
+async def cb_member_profile(query: CallbackQuery) -> None:
+    await query.answer()
+    parts = str(query.data).split(":")
+    # menu:member:<page>:<TAGWITHOUT#>
+    page = 1
+    tag = ""
+    if len(parts) >= 4:
+        try:
+            page = int(parts[2])
+        except Exception:
+            page = 1
+        tag = "#" + parts[3].strip().lstrip("#")
+
+    if not validate_tag(tag):
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⬅️ Участники", callback_data=f"menu:members:{page}"),
+                    InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home"),
+                ]
+            ]
+        )
+        await _edit_or_send(query.message, "❌ <b>Не удалось открыть игрока</b> — неверный тег.", kb)
+        return
+
+    data = await _api(get_player_info, tag)
+    err = check_api_error(data, context=f"member profile {tag}")
+    if err:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⬅️ Участники", callback_data=f"menu:members:{page}"),
+                    InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home"),
+                ]
+            ]
+        )
+        await _edit_or_send(query.message, err, kb)
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⬅️ Участники", callback_data=f"menu:members:{page}"),
+                InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home"),
+            ]
+        ]
+    )
+    await _edit_or_send(query.message, build_player_text(data), kb)
+
+
+@router_dp.callback_query(F.data == "menu:find")
+async def cb_find(query: CallbackQuery) -> None:
+    await query.answer()
+    text = (
+        "🔎 <b>Поиск по участникам</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Напиши команду:\n"
+        "<code>/find часть_ника</code>\n\n"
+        "Пример:\n"
+        "<code>/find andr</code>"
+    )
+    await _edit_or_send(query.message, text, main_menu_keyboard(2))
+
+
+@router_dp.callback_query(F.data == "menu:link")
+async def cb_link(query: CallbackQuery) -> None:
+    await query.answer()
+    url = clan_profile_url(CLAN_TAG)
+    text = (
+        "🔗 <b>Ссылка на клан</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⧉ Тег: <code>{_safe(CLAN_TAG)}</code>\n"
+        f"{url}"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Открыть клан", url=url)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:more")],
+        ]
+    )
+    await _edit_or_send(query.message, text, kb)
+
+
 @router_dp.callback_query(F.data == "menu:leaders")
 async def cb_leaders(query: CallbackQuery) -> None:
     await query.answer()
-    data = get_clan_members(CLAN_TAG)
+    data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="leaders (menu)")
     if err:
         await _edit_or_send(query.message, err, main_menu_keyboard())
@@ -1469,10 +1763,10 @@ async def cb_notify(query: CallbackQuery) -> None:
     if target_chat_id in _notify_tasks and not _notify_tasks[target_chat_id].done():
         _notify_tasks[target_chat_id].cancel()
         _notify_tasks.pop(target_chat_id, None)
+        _notify_message_ids.pop(target_chat_id, None)
         text = (
-            "🔕 <b>Уведомления выключены</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Оповещения по неатакующим в КВ/ЛВК остановлены."
+            "🔕 <b>Уведомления выключены</b>\n\n"
+            "Оповещения остановлены."
         )
         await _edit_or_send(query.message, text, main_menu_keyboard())
         return
@@ -1495,12 +1789,9 @@ async def cb_notify(query: CallbackQuery) -> None:
         return
 
     text = (
-        "🔔 <b>Уведомления включены</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Чат: <code>{target_chat_id}</code>\n\n"
-        "Теперь бот будет периодически писать в чат, кто <b>не атаковал</b> в КВ/ЛВК,\n"
-        "и сколько осталось времени.\n\n"
-        "<i>Нажми «🔔 Уведомления» ещё раз, чтобы выключить.</i>"
+        "🔔 <b>Уведомления включены</b>\n\n"
+        f"Чат: <code>{target_chat_id}</code>\n"
+        "<i>Нажми кнопку ещё раз, чтобы выключить.</i>"
     )
     await _edit_or_send(query.message, text, main_menu_keyboard())
 
@@ -1509,7 +1800,7 @@ async def cb_notify(query: CallbackQuery) -> None:
 async def cb_warlog(query: CallbackQuery) -> None:
     await query.answer()
 
-    info = get_clan_info(CLAN_TAG)
+    info = await _api(get_clan_info, CLAN_TAG)
     info_err = check_api_error(info, context="warlog clan info (menu)")
     if info_err:
         await _edit_or_send(query.message, info_err, main_menu_keyboard())
@@ -1524,7 +1815,7 @@ async def cb_warlog(query: CallbackQuery) -> None:
         await _edit_or_send(query.message, text, main_menu_keyboard())
         return
 
-    data = get_warlog()
+    data = await _api(get_warlog)
     err = check_api_error(data, context="warlog (menu)")
     if err:
         await _edit_or_send(query.message, err, main_menu_keyboard())
@@ -1536,7 +1827,7 @@ async def cb_warlog(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:capital")
 async def cb_capital(query: CallbackQuery) -> None:
     await query.answer()
-    data = get_capital_raid_seasons(1)
+    data = await _api(get_capital_raid_seasons, 1)
     err = check_api_error(data, context="capital raids (menu)")
     if err:
         await _edit_or_send(query.message, err, main_menu_keyboard())
@@ -1547,7 +1838,7 @@ async def cb_capital(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:cwl")
 async def cb_cwl(query: CallbackQuery) -> None:
     await query.answer()
-    data = get_cwl_group()
+    data = await _api(get_cwl_group)
     if isinstance(data, dict) and data.get("_error") == "not_found":
         text = (
             "🏅 <b>Лига войн клана (ЛВК)</b>\n"
@@ -1645,7 +1936,7 @@ async def cb_cwl_round(query: CallbackQuery) -> None:
     except Exception:
         round_num = 1
 
-    group = get_cwl_group()
+    group = await _api(get_cwl_group)
     if isinstance(group, dict) and group.get("_error") == "not_found":
         text = (
             "🏅 <b>Лига войн клана (ЛВК)</b>\n"
@@ -1691,14 +1982,73 @@ async def cb_cwl_round(query: CallbackQuery) -> None:
 @router_dp.message(Command("start"))
 async def handle_start(message: Message) -> None:
     """Главное меню бота."""
-    text = (
-        "🏰 <b>Клан-бот Clash of Clans</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Клан по умолчанию: <code>{CLAN_TAG}</code>\n\n"
-        "Выбери раздел кнопками ниже."
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    await message.answer(build_home_text(), parse_mode="HTML", reply_markup=main_menu_keyboard(1))
     logger.info("User %s triggered /start", message.from_user.id)
+
+
+@router_dp.message(Command("reset"))
+async def handle_reset(message: Message) -> None:
+    """
+    Emergency reset for API issues:
+    - cancels notification tasks
+    - clears cached API token
+    - re-authenticates and verifies API access
+    """
+    if not _is_owner(message):
+        await message.answer(
+            "⛔ <b>Нет доступа</b>\n\nЭта команда доступна только владельцу бота.",
+            parse_mode="HTML",
+        )
+        return
+
+    status = await message.answer("♻️ <i>Перезапускаю API...</i>", parse_mode="HTML")
+
+    # Stop notification loops (they will be restarted manually by pressing the button again)
+    for chat_id, task in list(_notify_tasks.items()):
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    _notify_tasks.clear()
+
+    # Reset token cache
+    global _clash_token, _clash_token_source
+    _clash_token = ""
+    _clash_token_source = "unset"
+
+    try:
+        await _api(get_clash_token)
+        clan = await _api(get_clan_info, CLAN_TAG)
+        err = check_api_error(clan, context="reset verify clan")
+        if err:
+            await message.answer(
+                "⚠️ <b>Reset выполнен</b>, но проверка API вернула ошибку:\n\n"
+                + err
+                + "\n\n<i>Попробуй ещё раз через минуту или проверь токен/доступ.</i>",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        cname = _safe((clan or {}).get("name", "—"))
+        await status.edit_text(
+            "✅ <b>Готово</b>\n"
+            "\n"
+            "Токен обновлён. Уведомления остановлены.\n"
+            f"Проверка: <b>{cname}</b> <code>{_safe(CLAN_TAG)}</code>.",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as exc:
+        logger.error("Reset failed: %s", exc)
+        await status.edit_text(
+            "❌ <b>Reset не удался</b>\n"
+            "\n"
+            "Не получилось обновить токен/проверить API.\n"
+            "<i>Попробуй ещё раз через минуту.</i>",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 @router_dp.message(Command("chatid"))
@@ -1713,6 +2063,80 @@ async def handle_chatid(message: Message) -> None:
         "<i>Скопируй ID и вставь в clash.py в переменную CHAT_ID.</i>"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+
+@router_dp.message(Command("find"))
+async def handle_find(message: Message) -> None:
+    """Поиск по участникам клана по нику/тегу."""
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "🔎 <b>Поиск</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Напиши:\n"
+            "<code>/find часть_ника</code>\n\n"
+            "Пример:\n"
+            "<code>/find andr</code>",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(2),
+        )
+        return
+
+    query = parts[1].strip()
+    data = await _api(get_clan_members, CLAN_TAG)
+    err = check_api_error(data, context="find members")
+    if err:
+        await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard(2))
+        return
+
+    members: list[dict] = data.get("items", [])
+    matches = search_members(members, query)[:20]
+    if not matches:
+        await message.answer(
+            "🔎 <b>Поиск</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Ничего не найдено по запросу: <code>{_safe(query)}</code>",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(2),
+        )
+        return
+
+    lines: list[str] = []
+    buttons: list[InlineKeyboardButton] = []
+    for idx, m in enumerate(matches, start=1):
+        name = _safe(m.get("name", "—"))
+        tag = _safe(m.get("tag", ""))
+        th = m.get("townHallLevel", "?")
+        trophies = format_number(m.get("trophies"))
+        trophy_league = _safe((m.get("league") or {}).get("name", "—"))
+        ranked_league = _safe((m.get("leagueTier") or {}).get("name", "—"))
+        lines.append(
+            f"{idx}. <b>{name}</b> <code>{tag}</code> — TH{th} — 🏆 {trophies} — ⚡ {ranked_league} — 🏅 {trophy_league}"
+        )
+
+        if idx <= 10:
+            tag_no_hash = _norm_tag(m.get("tag")).lstrip("#")
+            buttons.append(
+                InlineKeyboardButton(text=str(idx), callback_data=f"menu:member:1:{tag_no_hash}")
+            )
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if buttons:
+        kb_rows.append(buttons[:5])
+        if len(buttons) > 5:
+            kb_rows.append(buttons[5:10])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    text = (
+        "🔎 <b>Результаты поиска</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Запрос: <code>{_safe(query)}</code>\n"
+        f"Найдено: <b>{len(matches)}</b>\n\n"
+        + "\n".join(lines)
+        + "\n\n<i>Нажми цифру, чтобы открыть профиль.</i>"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @router_dp.message(Command("help"))
@@ -1745,7 +2169,7 @@ async def handle_clan(message: Message) -> None:
         )
         return
 
-    data = get_clan_info(clan_tag)
+    data = await _api(get_clan_info, clan_tag)
     err = check_api_error(data, context="clan info")
     if err:
         await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
@@ -1784,72 +2208,15 @@ async def handle_player(message: Message) -> None:
         )
         return
 
-    await message.answer("🔍 <i>Ищу игрока...</i>", parse_mode="HTML")
+    status = await message.answer("🔍 <i>Секунду…</i>", parse_mode="HTML")
 
-    data = get_player_info(raw_tag)
+    data = await _api(get_player_info, raw_tag)
     err = check_api_error(data, context=f"player {raw_tag}")
     if err:
-        await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
+        await status.edit_text(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
         return
 
-    name = _safe(data.get("name", "—"))
-    tag = _safe(data.get("tag", "—"))
-    th_level = data.get("townHallLevel", "N/A")
-    bh_level = data.get("builderHallLevel", "N/A")
-    exp_level = data.get("expLevel", "N/A")
-    trophies = format_number(data.get("trophies"))
-    best_trophies = format_number(data.get("bestTrophies"))
-    war_stars = format_number(data.get("warStars"))
-    attack_wins = format_number(data.get("attackWins"))
-    defense_wins = format_number(data.get("defenseWins"))
-    donations = format_number(data.get("donations"))
-    donations_received = format_number(data.get("donationsReceived"))
-    league_name = _safe(data.get("league", {}).get("name", "Без лиги"))
-
-    clan_data = data.get("clan", {})
-    clan_name = _safe(clan_data.get("name", "Нет клана"))
-    clan_tag = _safe(clan_data.get("tag", ""))
-    role = data.get("role", "member")
-    role_label = get_role_label(role)
-    role_emoji = get_role_emoji(role)
-
-    # TH emoji by level
-    def th_emoji(level: int | str) -> str:
-        try:
-            lvl = int(level)
-            return "🏰" if lvl >= 12 else "🏠"
-        except (ValueError, TypeError):
-            return "🏠"
-
-    text = (
-        f"👤 <b>Профиль игрока</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎮 <b>Ник:</b> {name}\n"
-        f"🏷 <b>Тег:</b> <code>{tag}</code>\n"
-        f"📊 <b>Уровень:</b> {exp_level}\n"
-        f"🏅 <b>Лига:</b> {league_name}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{th_emoji(th_level)} <b>ТХ:</b> {th_level}\n"
-        f"🔨 <b>БХ:</b> {bh_level}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 <b>Трофеи:</b> {trophies}\n"
-        f"🥇 <b>Лучшие:</b> {best_trophies}\n"
-        f"⭐ <b>Звёзды войны:</b> {war_stars}\n"
-        f"⚔️ <b>Победы атаки:</b> {attack_wins}\n"
-        f"🛡 <b>Победы защиты:</b> {defense_wins}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎁 <b>Отдал:</b> {donations}\n"
-        f"📥 <b>Получил:</b> {donations_received}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏰 <b>Клан:</b> {clan_name}"
-    )
-
-    if clan_tag:
-        text += f" <code>{clan_tag}</code>"
-
-    text += f"\n{role_emoji} <b>Роль:</b> {role_label}"
-
-    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    await status.edit_text(build_player_text(data), parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 
 @router_dp.message(Command("war"))
@@ -1857,7 +2224,7 @@ async def handle_war(message: Message) -> None:
     """Показать текущую войну клана (CLAN_TAG)."""
     logger.info("User %s triggered /war", message.from_user.id)
 
-    data = get_current_war(CLAN_TAG)
+    data = await _api(get_current_war, CLAN_TAG)
     err = check_api_error(data, context="current war")
     if err:
         await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
@@ -1871,15 +2238,15 @@ async def handle_members(message: Message) -> None:
     """Показать участников клана (страница 1)."""
     logger.info("User %s triggered /members", message.from_user.id)
 
-    data = get_clan_members(CLAN_TAG)
+    data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="clan members")
     if err:
         await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
         return
 
     members: list[dict] = data.get("items", [])
-    text, total_pages = build_members_text(members, page=1, per_page=10)
-    await message.answer(text, parse_mode="HTML", reply_markup=members_pager_keyboard(1, total_pages))
+    text, total_pages, chunk = build_members_text(members, page=1, per_page=10)
+    await message.answer(text, parse_mode="HTML", reply_markup=members_pager_keyboard(1, total_pages, chunk))
 
 
 @router_dp.message(Command("top"))
@@ -1887,7 +2254,7 @@ async def handle_top(message: Message) -> None:
     """Топ 10 участников клана по трофеям."""
     logger.info("User %s triggered /top", message.from_user.id)
 
-    data = get_clan_members(CLAN_TAG)
+    data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="top members")
     if err:
         await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
@@ -1917,11 +2284,12 @@ async def handle_top(message: Message) -> None:
         tag = _safe(member.get("tag", ""))
         trophies = format_number(member.get("trophies"))
         th_level = member.get("townHallLevel", "?")
-        league = _safe((member.get("league") or {}).get("name", "—"))
+        trophy_league = _safe((member.get("league") or {}).get("name", "—"))
+        ranked_league = _safe((member.get("leagueTier") or {}).get("name", "—"))
 
         lines.append(
             f"{medal} <b>{name}</b> <code>{tag}</code>\n"
-            f"    🏰 TH{th_level} • 🏆 <b>{trophies}</b> • 🏅 {league}"
+            f"    🏰 TH{th_level} • 🏆 <b>{trophies}</b> • ⚡ {ranked_league} • 🏅 {trophy_league}"
         )
 
     text = (
@@ -1938,7 +2306,7 @@ async def handle_donations(message: Message) -> None:
     """Топ донатеров клана за сезон."""
     logger.info("User %s triggered /donations", message.from_user.id)
 
-    data = get_clan_members(CLAN_TAG)
+    data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="donations")
     if err:
         await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
@@ -1969,10 +2337,11 @@ async def handle_donations(message: Message) -> None:
         donations = format_number(member.get("donations"))
         received = format_number(member.get("donationsReceived"))
         role_emoji = get_role_emoji(member.get("role", "member"))
+        ranked_league = _safe((member.get("leagueTier") or {}).get("name", "—"))
 
         lines.append(
             f"{medal} {role_emoji} <b>{name}</b> <code>{tag}</code>\n"
-            f"    🎁 Отдал: <b>{donations}</b> • 📥 Получил: {received}"
+            f"    🎁 Отдал: <b>{donations}</b> • 📥 Получил: {received} • ⚡ {ranked_league}"
         )
 
     text = (
@@ -2000,15 +2369,12 @@ async def handle_raw_tag(message: Message) -> None:
         raw_tag,
     )
 
-    await message.answer(
-        f"🔍 <i>Нашёл тег <code>{_safe(raw_tag)}</code> — ищу игрока...</i>",
-        parse_mode="HTML",
-    )
+    status = await message.answer("🔍 <i>Секунду…</i>", parse_mode="HTML")
 
-    data = get_player_info(raw_tag)
+    data = await _api(get_player_info, raw_tag)
     err = check_api_error(data, context=f"auto-tag {raw_tag}")
     if err:
-        await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
+        await status.edit_text(err, parse_mode="HTML", reply_markup=main_menu_keyboard())
         return
 
     name = _safe(data.get("name", "—"))
@@ -2028,7 +2394,7 @@ async def handle_raw_tag(message: Message) -> None:
         f"<i>Полный профиль: /player {tag}</i>"
     )
 
-    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    await status.edit_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 
 # ============================================================
