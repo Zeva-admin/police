@@ -7,7 +7,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import requests
@@ -40,6 +40,12 @@ CLASH_PASSWORD: str = "My happy life43"
 # /clan #TAG, /members #TAG, /war #TAG, etc.
 CLAN_TAG: str = "#2GYQ8VJV2"
 
+# Clan display name for UI (set your clan name here, e.g. "В.К.Л")
+CLAN_DISPLAY_NAME: str = "В.К.Л"
+
+# Cached clan name from the game (filled on startup/reset when available)
+_CLAN_NAME_CACHED: str | None = None
+
 # Who can use admin commands (like /reset). Set your Telegram user id here.
 OWNER_USER_ID: int = 7053001262
 
@@ -47,6 +53,10 @@ OWNER_USER_ID: int = 7053001262
 # Example: -1001234567890
 # If set to 0, bot uses the chat where you pressed "🔔 Уведомления".
 CHAT_ID: int = -1002552886756
+
+# Local time formatting for UI (UTC offset). Ashgabat is UTC+5.
+LOCAL_UTC_OFFSET_HOURS: int = 5
+LOCAL_TZ = timezone(timedelta(hours=LOCAL_UTC_OFFSET_HOURS))
 
 # API settings
 COC_API_BASE: str = "https://api.clashofclans.com/v1"
@@ -489,22 +499,22 @@ def get_error_message(error_key: str) -> str:
         ),
         "timeout": (
             "🌐 <b>Таймаут</b>\n"
-            "Clash API отвечает слишком долго.\n"
+            "Сервис отвечает слишком долго.\n"
             "Попробуй ещё раз через несколько секунд."
         ),
         "connection": (
             "🔌 <b>Нет соединения</b>\n"
-            "Не удаётся подключиться к Clash API.\n"
+            "Не удаётся подключиться к сервису.\n"
             "Попробуй позже."
         ),
         "maintenance": (
             "🛠 <b>Техработы</b>\n"
-            "Clash API сейчас на обслуживании.\n"
+            "Сервис сейчас на обслуживании.\n"
             "Это не ошибка бота — попробуй позже."
         ),
         "service_unavailable": (
             "⚠️ <b>Сервис недоступен</b>\n"
-            "Clash API временно недоступен.\n"
+            "Сервис временно недоступен.\n"
             "Попробуй ещё раз через пару минут."
         ),
     }
@@ -587,7 +597,7 @@ def check_api_error(data: dict | None, context: str = "") -> str | None:
     """
     if data is None:
         logger.warning("API returned None for: %s", context)
-        return "⚠️ <b>Ошибка API</b>\nНе удалось получить данные. Попробуй ещё раз."
+        return "⚠️ <b>Ошибка</b>\nНе удалось получить данные. Попробуй ещё раз."
 
     error_key = data.get("_error")
     if error_key:
@@ -760,7 +770,36 @@ def _normalize_state_label(state: str) -> str:
 def _format_time_utc(iso_str: str | None) -> str:
     if not iso_str:
         return "—"
-    return iso_str.replace("T", " ").replace(".000Z", " UTC")
+    raw = str(iso_str).strip()
+    dt = _parse_coc_time(raw)
+
+    if not dt:
+        s = raw
+        s = s.replace("T", " ").replace(".000Z", "").replace("Z", "").strip()
+        if s.upper().endswith("UTC"):
+            s = s[:-3].strip()
+        for fmt in ("%Y%m%d %H%M%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+        if not dt:
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if len(digits) >= 14:
+                try:
+                    dt = datetime.strptime(digits[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    dt = None
+
+    if not dt:
+        return raw
+
+    local = dt.astimezone(LOCAL_TZ)
+    local_s = local.strftime("%d.%m.%Y %H:%M")
+    sign = "+" if LOCAL_UTC_OFFSET_HOURS >= 0 else "−"
+    off = abs(int(LOCAL_UTC_OFFSET_HOURS))
+    return f"{local_s} (UTC{sign}{off})"
 
 
 def _parse_coc_time(ts: str | None) -> datetime | None:
@@ -799,14 +838,20 @@ def _time_left(end_ts: str | None) -> str:
 
 
 def build_home_text() -> str:
-    chat_target = (
-        f"<code>{CHAT_ID}</code>" if isinstance(CHAT_ID, int) and CHAT_ID != 0 else "<i>не задан (берётся чат, где нажали кнопку)</i>"
-    )
+    display = (CLAN_DISPLAY_NAME or "").strip()
+    real_name = (_CLAN_NAME_CACHED or "").strip()
+    clan_title = _safe(display or real_name or "Клан")
+
+    extra = ""
+    if display and real_name and real_name.lower() != display.lower():
+        extra = f"\n<i>{_safe(real_name)}</i>"
+
     return (
-        "Меню клана:\n"
-        f"⧉ <code>{_safe(CLAN_TAG)}</code>\n\n"
-        f"Уведомления в чат: {chat_target}\n\n"
-        "<i>/player #ТЕГ • /find ник • /chatid • /reset</i>"
+        "Привет! 👋\n"
+        f"Рад видеть тебя в меню клана <b>{clan_title}</b>.{extra}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Тег клана: <code>{_safe(CLAN_TAG)}</code>\n\n"
+        "Выбирай раздел кнопками — всё обновляется прямо здесь, без лишних сообщений."
     )
 
 
@@ -848,7 +893,7 @@ def build_clan_text(data: dict) -> str:
     url = clan_profile_url(tag)
     return (
         f"🏰 <b>{name}</b>\n"
-        f"⧉ <code>{tag}</code>\n\n"
+        f"<code>{tag}</code>\n\n"
         f"⭐ Уровень: <b>{level}</b> • {location}\n"
         f"🔐 Тип: {clan_type}\n"
         f"{desc_block}\n\n"
@@ -917,7 +962,7 @@ def build_members_text(members: list[dict], page: int, per_page: int) -> tuple[s
 
     header = (
         f"👥 <b>Участники</b> • всего <b>{total}</b>\n"
-        f"⧉ <code>{_safe(CLAN_TAG)}</code>\n\n"
+        f"<code>{_safe(CLAN_TAG)}</code>\n\n"
         "<i>Цифра под списком откроет профиль.</i>\n\n"
     )
     body = "\n\n".join(lines) if lines else "<i>Участников не найдено.</i>"
@@ -969,7 +1014,7 @@ def build_war_text(data: dict) -> str:
         th = m.get("townhallLevel", "?")
         used = len(m.get("attacks", []) or [])
         if used < attacks_per_member:
-            missing.append(f"• <b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
+            missing.append(f"<b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
 
     opp_missing_count = 0
     for m in opp_members:
@@ -997,19 +1042,20 @@ def build_war_text(data: dict) -> str:
         destr = int(a.get("destructionPercentage", 0) or 0)
         stars_str = "⭐" * stars + "☆" * (3 - stars)
         last_attacks_lines.append(
-            f"• <b>{attacker_name}</b> → #{dpos} <b>{defender_name}</b> — {stars_str} — <b>{destr}%</b>"
+            f"<b>{attacker_name}</b> → #{dpos} <b>{defender_name}</b> — {stars_str} — <b>{destr}%</b>"
         )
 
-    missing_block = (
-        "\n\n❌ <b>Не добили атаки:</b>\n" + "\n".join(missing)
-        if missing
-        else "\n\n✅ <b>Все участники сделали свои атаки.</b>"
-    )
-    last_attacks_block = (
-        "\n\n🧾 <b>Последние атаки:</b>\n" + "\n".join(last_attacks_lines)
-        if last_attacks_lines
-        else ""
-    )
+    if missing:
+        missing_block = "\n\n❌ <b>Кому ещё нужно атаковать:</b>\n" + "\n".join(
+            f"{i}. {line}" for i, line in enumerate(missing, start=1)
+        )
+    else:
+        missing_block = "\n\n✅ <b>По нашим — все атаки сделаны.</b>"
+    last_attacks_block = ""
+    if last_attacks_lines:
+        last_attacks_block = "\n\n🧾 <b>Последние атаки:</b>\n" + "\n".join(
+            f"{i}. {line}" for i, line in enumerate(last_attacks_lines, start=1)
+        )
 
     left_line = ""
     if our_left is not None and opp_left is not None:
@@ -1020,15 +1066,15 @@ def build_war_text(data: dict) -> str:
 
     return (
         "⚔️ <b>Война</b>\n\n"
-        f"⧉ <code>{_safe(CLAN_TAG)}</code>\n"
+        f"Тег клана: <code>{_safe(CLAN_TAG)}</code>\n"
         f"Статус: <b>{_safe(_normalize_state_label(state))}</b>\n"
         f"Формат: <b>{team_size}×{team_size}</b> • атак на участника: <b>{attacks_per_member}</b>\n"
-        f"🏁 Конец: <code>{_safe(end)}</code>\n"
+        f"🏁 Конец: <b>{_safe(end)}</b>\n"
         f"⏳ Осталось: <b>{_safe(left)}</b>\n\n"
         f"🏰 <b>{our_name}</b>: ⭐ <b>{our_stars}</b> • 💥 <b>{our_destr:.2f}%</b>\n"
         f"🟥 <b>{opp_name}</b>: ⭐ <b>{opp_stars}</b> • 💥 <b>{opp_destr:.2f}%</b>"
         f"{left_line}"
-        f"\nНеатакующие: мы <b>{len(missing)}</b> • соперник <b>{opp_missing_count}</b>"
+        f"\nБез атак: мы <b>{len(missing)}</b> • соперник <b>{opp_missing_count}</b>"
         f"{missing_block}"
         f"{last_attacks_block}"
     )
@@ -1094,7 +1140,7 @@ def build_warlog_text(data: dict) -> str:
         lines.append(
             f"• <b>{result_ru}</b> vs <b>{opp_name}</b> ({team_size}×{team_size})\n"
             f"  ⭐ <b>{c_stars}</b>:<b>{o_stars}</b> • 💥 <b>{c_d:.2f}%</b>:<b>{o_d:.2f}%</b>\n"
-            f"  🕒 <code>{_safe(end_time)}</code>"
+            f"  🕒 {_safe(end_time)}"
         )
 
     return (
@@ -1231,7 +1277,7 @@ def build_player_text(data: dict) -> str:
         f"👤 <b>Профиль игрока</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎮 <b>Ник:</b> {name}\n"
-        f"⧉ <b>Тег:</b> <code>{tag}</code>\n"
+        f"Тег: <code>{tag}</code>\n"
         f"📊 <b>Уровень:</b> {exp_level}\n"
         f"⚡ <b>Ранг:</b> {ranked_league}\n"
         f"🏅 <b>Трофейная лига:</b> {trophy_league}\n\n"
@@ -1256,9 +1302,9 @@ def build_player_text(data: dict) -> str:
     if league_group_tag or league_season:
         text += "\n\n━━━━━━━━━━━━━━━━━━━━\n"
         if league_group_tag:
-            text += f"⧉ <b>Группа ранга:</b> <code>{league_group_tag}</code>\n"
+            text += f"Группа ранга: <code>{league_group_tag}</code>\n"
         if league_season:
-            text += f"⧉ <b>Сезон ранга:</b> <code>{league_season}</code>"
+            text += f"Сезон ранга: <code>{league_season}</code>"
     return text
 
 
@@ -1351,7 +1397,9 @@ def get_war_missing_attacks(war: dict, clan_tag: str) -> tuple[str, list[str], s
       end_time: endTime string (API format)
     """
     state = str(war.get("state", "notInWar"))
-    end_time = str(war.get("endTime", "") or "")
+    # For preparation we count down to the battle start, for inWar — to the battle end.
+    deadline = war.get("endTime") if state == "inWar" else war.get("startTime")
+    end_time = str(deadline or "")
 
     attacks_per_member = int(war.get("attacksPerMember", 2) or 2)
     clan = war.get("clan", {}) or {}
@@ -1370,7 +1418,7 @@ def get_war_missing_attacks(war: dict, clan_tag: str) -> tuple[str, list[str], s
         if used < attacks_per_member:
             name = _safe(m.get("name", "—"))
             th = m.get("townhallLevel", m.get("townHallLevel", "?"))
-            missing_lines.append(f"• <b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
+            missing_lines.append(f"<b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
 
     return "Война", missing_lines, state, end_time
 
@@ -1407,19 +1455,30 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
                 await asyncio.sleep(poll_seconds)
                 continue
 
+            # During preparation attacks are impossible; remind only when the battle is live.
+            if state == "preparation":
+                await asyncio.sleep(poll_seconds)
+                continue
+
             if not missing:
                 await asyncio.sleep(poll_seconds)
                 continue
 
             time_left = _time_left(end_time)
-            title = f"🔔 <b>{context}</b> — атаки"
-            body = ", ".join(_safe(line.split("</b>")[0].split("<b>")[-1]) for line in missing[:20])
-            if len(missing) > 20:
-                body += f" …и ещё {len(missing) - 20}"
+            missing_block = "\n".join(f"{i}. {line}" for i, line in enumerate(missing[:25], start=1))
+            if len(missing) > 25:
+                missing_block += f"\n…и ещё <b>{len(missing) - 25}</b>"
+
+            state_label = "подготовка" if state == "preparation" else "война"
             text = (
-                f"{title}\n"
+                f"🔔 <b>{context}: напоминание</b>\n"
+                f"Сейчас: <b>{state_label}</b>\n"
                 f"Осталось: <b>{_safe(time_left)}</b>\n"
-                f"Не атаковали ({len(missing)}): {body}"
+                f"В списке: <b>{len(missing)}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<b>Кому ещё нужно атаковать:</b>\n"
+                f"{missing_block}\n\n"
+                "<i>Сообщение обновляется само — новых сообщений в чат не будет.</i>"
             )
             fingerprint = f"{context}|{state}|{end_time}|{';'.join(missing)}"
 
@@ -1729,7 +1788,7 @@ async def cb_link(query: CallbackQuery) -> None:
     text = (
         "🔗 <b>Ссылка на клан</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⧉ Тег: <code>{_safe(CLAN_TAG)}</code>\n"
+        f"Тег: <code>{_safe(CLAN_TAG)}</code>\n"
         f"{url}"
     )
     kb = InlineKeyboardMarkup(
@@ -2001,7 +2060,7 @@ async def handle_reset(message: Message) -> None:
         )
         return
 
-    status = await message.answer("♻️ <i>Перезапускаю API...</i>", parse_mode="HTML")
+    status = await message.answer("♻️ <i>Перезапускаю соединение...</i>", parse_mode="HTML")
 
     # Stop notification loops (they will be restarted manually by pressing the button again)
     for chat_id, task in list(_notify_tasks.items()):
@@ -2021,21 +2080,24 @@ async def handle_reset(message: Message) -> None:
         clan = await _api(get_clan_info, CLAN_TAG)
         err = check_api_error(clan, context="reset verify clan")
         if err:
-            await message.answer(
-                "⚠️ <b>Reset выполнен</b>, но проверка API вернула ошибку:\n\n"
+            await status.edit_text(
+                "⚠️ <b>Соединение обновлено</b>, но сейчас данные недоступны.\n\n"
                 + err
-                + "\n\n<i>Попробуй ещё раз через минуту или проверь токен/доступ.</i>",
+                + "\n\n<i>Обычно помогает просто подождать 1–2 минуты и попробовать снова.</i>",
                 parse_mode="HTML",
                 reply_markup=main_menu_keyboard(),
             )
             return
 
         cname = _safe((clan or {}).get("name", "—"))
+        global _CLAN_NAME_CACHED
+        if cname and cname != "—":
+            _CLAN_NAME_CACHED = cname
         await status.edit_text(
             "✅ <b>Готово</b>\n"
             "\n"
-            "Токен обновлён. Уведомления остановлены.\n"
-            f"Проверка: <b>{cname}</b> <code>{_safe(CLAN_TAG)}</code>.",
+            "Соединение обновлено. Уведомления остановлены.\n"
+            f"Клан: <b>{cname}</b> <code>{_safe(CLAN_TAG)}</code>.",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard(),
         )
@@ -2044,7 +2106,7 @@ async def handle_reset(message: Message) -> None:
         await status.edit_text(
             "❌ <b>Reset не удался</b>\n"
             "\n"
-            "Не получилось обновить токен/проверить API.\n"
+            "Не получилось обновить соединение.\n"
             "<i>Попробуй ещё раз через минуту.</i>",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard(),
@@ -2054,13 +2116,14 @@ async def handle_reset(message: Message) -> None:
 @router_dp.message(Command("chatid"))
 async def handle_chatid(message: Message) -> None:
     """Показать ID текущего чата (для настройки CHAT_ID)."""
+    if not _is_owner(message):
+        return
     chat = message.chat
     text = (
         "🆔 <b>ID чата</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Тип: <b>{_safe(getattr(chat, 'type', '—'))}</b>\n"
-        f"ID: <code>{chat.id}</code>\n\n"
-        "<i>Скопируй ID и вставь в clash.py в переменную CHAT_ID.</i>"
+        f"ID: <code>{chat.id}</code>"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
@@ -2432,6 +2495,15 @@ async def main() -> None:
     logger.info("Initializing Clash of Clans API token...")
     get_clash_token()
     logger.info("Клан по умолчанию: %s", CLAN_TAG)
+    try:
+        clan = get_clan_info(CLAN_TAG)
+        if isinstance(clan, dict) and not clan.get("_error"):
+            cname = str(clan.get("name") or "").strip()
+            global _CLAN_NAME_CACHED
+            if cname:
+                _CLAN_NAME_CACHED = cname
+    except Exception:
+        pass
 
     # Render health-check server (binds to $PORT). Safe to run locally too.
     server = await start_render_server()
