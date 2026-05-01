@@ -8,18 +8,22 @@ import signal
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from urllib.parse import quote
 
 import requests
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
+from PIL import Image, ImageDraw, ImageFont
 
 try:
     import clashapi  # required for dynamic IP setups
@@ -72,6 +76,7 @@ _clash_token_source: str = "unset"  # "clashapi" | "unset"
 # Notification tasks per chat (group/supergroup)
 _notify_tasks: dict[int, asyncio.Task] = {}
 _notify_message_ids: dict[int, int] = {}
+
 SHUTDOWN_EVENT = asyncio.Event()
 
 # ============================================================
@@ -664,6 +669,7 @@ def main_menu_keyboard(page: int = 1) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📜 Журнал войн", callback_data="menu:warlog"),
                 InlineKeyboardButton(text="🏚️ Столица", callback_data="menu:capital"),
             ],
+            [InlineKeyboardButton(text="📊 Статистика игрока", callback_data="menu:pstats")],
             [InlineKeyboardButton(text="➕ Ещё", callback_data="menu:more")],
         ]
     )
@@ -968,6 +974,807 @@ def build_members_text(members: list[dict], page: int, per_page: int) -> tuple[s
     )
     body = "\n\n".join(lines) if lines else "<i>Участников не найдено.</i>"
     return header + body, total_pages, chunk
+
+
+def player_stats_select_text_and_kb(members: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    One-message full list (up to 50) + digit buttons to pick a player for stats.
+    """
+    lines: list[str] = []
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+
+    for idx, m in enumerate([x for x in members if isinstance(x, dict)][:50], start=1):
+        name = _safe(m.get("name", "—"))
+        tag = _norm_tag(m.get("tag"))
+        trophies = format_number(m.get("trophies"))
+        trophy_league = _safe((m.get("league") or {}).get("name", "—"))
+        role = m.get("role", "member")
+        role_label = get_role_label(role)
+        role_emoji = get_role_emoji(role)
+
+        # Keep the list readable and under Telegram limits
+        if len(name) > 18:
+            name = name[:17] + "…"
+
+        lines.append(
+            f"{idx}. {role_emoji} <b>{name}</b> — 🏆 {trophies} • {trophy_league} • {role_label}\n"
+            f"    <code>{_safe(tag)}</code>"
+        )
+
+        tag_compact = tag.lstrip("#")
+        row.append(InlineKeyboardButton(text=str(idx), callback_data=f"pstats:pick:{tag_compact}"))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    text = (
+        "📊 <b>Статистика игрока</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Выбери игрока цифрой ниже — я соберу данные и сделаю понятную картинку с оценками.\n\n"
+        "<i>Подсказка: это одно сообщение, без листания страниц.</i>\n\n"
+        + "\n\n".join(lines)
+    )
+    # Telegram message limit safety
+    if len(text) > 3900:
+        text = text[:3899] + "…"
+    return text, kb
+
+
+def _score_percent(n: float, d: float) -> int:
+    if d <= 0:
+        return 0
+    v = int(round(max(0.0, min(1.0, n / d)) * 100))
+    return v
+
+
+def _completion_ratio(items: list[dict], village: str | None = None) -> tuple[float, float]:
+    """
+    Sum(level)/Sum(maxLevel) for lists like troops/heroes/spells/pets/equipment.
+    """
+    num = 0.0
+    den = 0.0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if village is not None and str(it.get("village", "")).lower() != str(village).lower():
+            continue
+        try:
+            lvl = float(it.get("level", it.get("lvl", 0)) or 0)
+        except Exception:
+            lvl = 0.0
+        try:
+            mx = float(it.get("maxLevel", it.get("max_level", 0)) or 0)
+        except Exception:
+            mx = 0.0
+        # If API doesn't provide maxLevel for some items, treat current level as max for scoring.
+        if mx <= 0:
+            mx = max(1.0, lvl)
+        num += max(0.0, min(lvl, mx))
+        den += mx
+    return num, den
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    candidates = [
+        # Linux (Render)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        # Windows
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\calibri.ttf",
+    ]
+    for p in candidates:
+        try:
+            return ImageFont.truetype(p, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _text_w(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+    try:
+        box = draw.textbbox((0, 0), text, font=font)
+        return int(box[2] - box[0])
+    except Exception:
+        return len(text) * 10
+
+
+def _radar_points(cx: int, cy: int, radius: int, values: list[int]) -> list[tuple[int, int]]:
+    import math
+
+    n = max(3, len(values))
+    pts: list[tuple[int, int]] = []
+    for i, v in enumerate(values):
+        ang = (-math.pi / 2) + (2 * math.pi * i / n)
+        r = radius * (max(0, min(100, int(v))) / 100)
+        x = int(round(cx + math.cos(ang) * r))
+        y = int(round(cy + math.sin(ang) * r))
+        pts.append((x, y))
+    return pts
+
+
+def render_player_report_image(
+    title: str,
+    subtitle: str,
+    scores: dict[str, int],
+    updated_at: str,
+) -> bytes:
+    """
+    Creates a clear, readable PNG with category bars (0..100%).
+    """
+    width, height = 1200, 720
+    # Calm, non-neon palette
+    bg = (12, 14, 18)  # graphite
+    card = (20, 23, 30)
+    card2 = (26, 30, 40)
+    text_main = (230, 237, 243)
+    text_sub = (150, 162, 175)
+    muted = (120, 132, 145)
+    track = (34, 44, 60)
+
+    img = Image.new("RGB", (width, height), bg)
+    # Subtle vertical gradient for a more "pro" look
+    px = img.load()
+    for y in range(height):
+        t = y / max(1, height - 1)
+        r = int(bg[0] * (1 - t) + 16 * t)
+        g = int(bg[1] * (1 - t) + 18 * t)
+        b = int(bg[2] * (1 - t) + 24 * t)
+        for x in range(width):
+            px[x, y] = (r, g, b)
+
+    draw = ImageDraw.Draw(img)
+
+    font_title = _load_font(44)
+    font_sub = _load_font(24)
+    font_label = _load_font(24)
+    font_small = _load_font(18)
+
+    pad = 48
+
+    # Header card
+    # Soft glow behind header
+    draw.rounded_rectangle((pad - 6, 22, width - pad + 6, 178), radius=28, fill=(16, 18, 24))
+    draw.rounded_rectangle((pad, 28, width - pad, 172), radius=24, fill=card)
+    draw.text((pad + 30, 48), title, font=font_title, fill=text_main)
+    draw.text((pad + 30, 112), subtitle, font=font_sub, fill=text_sub)
+    upd = f"Обновлено: {updated_at}"
+    upd_x = (width - pad - 30) - _text_w(draw, upd, font_small)
+    draw.text((upd_x, 122), upd, font=font_small, fill=muted)
+
+    # Main card
+    draw.rounded_rectangle((pad - 6, 190, width - pad + 6, height - 70), radius=28, fill=(16, 18, 24))
+    draw.rounded_rectangle((pad, 196, width - pad, height - 76), radius=24, fill=card)
+
+    order = [
+        "Главная деревня",
+        "Войны",
+        "Стройбаза",
+        "Столица",
+        "Активность",
+        "Донаты",
+    ]
+    items: list[tuple[str, int]] = []
+    for k in order:
+        if k in scores:
+            items.append((k, int(scores.get(k, 0) or 0)))
+    # fallback for any extra keys
+    for k, v in scores.items():
+        if k not in order:
+            items.append((k, int(v or 0)))
+
+    # Left: radar chart
+    radar_cx = pad + 260
+    radar_cy = 420
+    radar_r = 170
+
+    # grid
+    for g in (20, 40, 60, 80, 100):
+        pts = _radar_points(radar_cx, radar_cy, radar_r, [g] * len(items))
+        draw.polygon(pts, outline=(38, 50, 68))
+    # axes + labels
+    import math
+
+    label_font = _load_font(18)
+    for i, (name, _v) in enumerate(items):
+        ang = (-math.pi / 2) + (2 * math.pi * i / max(3, len(items)))
+        x2 = int(round(radar_cx + math.cos(ang) * (radar_r + 18)))
+        y2 = int(round(radar_cy + math.sin(ang) * (radar_r + 18)))
+        draw.line((radar_cx, radar_cy, x2, y2), fill=(38, 50, 68), width=2)
+
+        # label position
+        lx = int(round(radar_cx + math.cos(ang) * (radar_r + 42)))
+        ly = int(round(radar_cy + math.sin(ang) * (radar_r + 42)))
+        # keep label readable: short name
+        short = name.replace("Главная деревня", "Деревня").replace("Стройбаза", "База").replace("Активность", "Актив.")
+        w = _text_w(draw, short, label_font)
+        draw.text((lx - w // 2, ly - 10), short, font=label_font, fill=text_sub)
+
+    vals = [v for _k, v in items]
+    poly = _radar_points(radar_cx, radar_cy, radar_r, vals)
+    # semi-transparent fill via overlay
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d2 = ImageDraw.Draw(overlay)
+    # muted steel-blue
+    d2.polygon(poly, fill=(90, 130, 180, 70), outline=(90, 130, 180, 210))
+    for x, y in poly:
+        d2.ellipse((x - 5, y - 5, x + 5, y + 5), fill=(90, 130, 180, 230))
+    img_rgba = img.convert("RGBA")
+    img_rgba.alpha_composite(overlay)
+    img = img_rgba.convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # Right: metric list with bars
+    list_left = pad + 520
+    top = 230
+    bar_w = (width - pad) - list_left - 30
+    row_h = 74
+    for idx, (name, val) in enumerate(items[:7]):
+        y0 = top + idx * row_h
+        draw.rounded_rectangle((list_left, y0, list_left + bar_w, y0 + 54), radius=16, fill=card2)
+        draw.text((list_left + 16, y0 + 14), name, font=font_label, fill=text_main)
+
+        val_i = int(max(0, min(100, int(val))))
+        pct_text = f"{val_i}%"
+        pct_w = _text_w(draw, pct_text, font_label)
+        pct_x = list_left + bar_w - 16 - pct_w
+        draw.text((pct_x, y0 + 12), pct_text, font=font_label, fill=text_main)
+
+        prog_x0 = list_left + 240
+        prog_y0 = y0 + 18
+        prog_h = 20
+        prog_w = max(200, pct_x - 14 - prog_x0)
+        draw.rounded_rectangle((prog_x0, prog_y0, prog_x0 + prog_w, prog_y0 + prog_h), radius=10, fill=track)
+        filled = int(prog_w * val_i / 100)
+
+        if val_i >= 80:
+            color = (70, 170, 120)   # calm green
+        elif val_i >= 60:
+            color = (90, 130, 180)   # steel blue
+        elif val_i >= 40:
+            color = (200, 170, 80)   # muted amber
+        else:
+            color = (200, 90, 90)    # muted red
+
+        if filled > 0:
+            draw.rounded_rectangle((prog_x0, prog_y0, prog_x0 + filled, prog_y0 + prog_h), radius=10, fill=color)
+
+    draw.text(
+        (pad + 10, height - 42),
+        "Нажми «Обновить», чтобы пересчитать по свежим данным.",
+        font=font_small,
+        fill=muted,
+    )
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def build_player_report_caption(
+    player: dict,
+    member: dict | None,
+    context_label: str,
+    scores: dict[str, int],
+    capital_line: str,
+    cwl_line: str,
+    updated_at: str,
+) -> str:
+    name = _safe(player.get("name", "—"))
+    tag = _safe(player.get("tag", "—"))
+    th = player.get("townHallLevel", "—")
+    exp = player.get("expLevel", "—")
+    trophies = format_number(player.get("trophies"))
+    league = _safe((player.get("league") or {}).get("name", "Без лиги"))
+    role = get_role_label((member or {}).get("role", "member")) if isinstance(member, dict) else "—"
+    donations = format_number(player.get("donations"))
+    donations_received = format_number(player.get("donationsReceived"))
+    bh = player.get("builderHallLevel", "—")
+    bb_trophies = format_number(player.get("builderBaseTrophies", player.get("versusTrophies")))
+    war_stars = format_number(player.get("warStars"))
+    attack_wins = format_number(player.get("attackWins"))
+
+    # Weighted overall (more fair)
+    weights = {
+        "Главная деревня": 0.35,
+        "Войны": 0.20,
+        "Стройбаза": 0.12,
+        "Столица": 0.13,
+        "Активность": 0.10,
+        "Донаты": 0.10,
+    }
+    wsum = 0.0
+    wtot = 0.0
+    for k, v in scores.items():
+        w = float(weights.get(k, 1.0 / max(1, len(scores))))
+        wsum += w * float(v)
+        wtot += w
+    overall = int(round(wsum / max(0.01, wtot)))
+    blocks = [
+        f"👤 <b>{name}</b> <code>{tag}</code>",
+        f"🏰 ТХ <b>{th}</b> • Уровень <b>{exp}</b>",
+        f"🏆 {trophies} • {league} • Роль: <b>{_safe(role)}</b>",
+        f"🔨 Стройбаза: БХ <b>{bh}</b> • 🏆 {bb_trophies}",
+        "",
+        f"📌 Оценка: <b>{overall}%</b> • {context_label}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "\n".join([f"• {k}: <b>{v}%</b>" for k, v in scores.items()]),
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⚔️ Войны: ⭐ <b>{war_stars}</b> • Победы атаки: <b>{attack_wins}</b>",
+        cwl_line,
+        capital_line,
+        f"🎁 Донаты: <b>{donations}</b> • Получил: <b>{donations_received}</b>",
+        "",
+        f"<i>Обновлено: {updated_at}</i>",
+    ]
+    text = "\n".join([b for b in blocks if b is not None])
+    if len(text) > 1000:
+        text = text[:999] + "…"
+    return text
+
+
+def player_report_keyboard(tag_compact: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Обновить", callback_data=f"pstats:refresh:{tag_compact}"),
+            ],
+            [InlineKeyboardButton(text="📊 Выбор игрока", callback_data="menu:pstats")],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")],
+        ]
+    )
+
+
+def _capital_member_from_seasons(seasons: dict | None, player_tag: str, max_items: int = 10) -> dict:
+    """
+    Extract aggregated capital raid stats for a player from last seasons (best-effort).
+    """
+    tag = _norm_tag(player_tag)
+    items = (seasons or {}).get("items", []) if isinstance(seasons, dict) else []
+    if not isinstance(items, list):
+        return {}
+    total_attacks = 0
+    total_looted = 0
+    total_stars = 0
+    total_destr = 0
+    total_attack_rows = 0
+    counted = 0
+
+    for season in items[:max(1, int(max_items))]:
+        if not isinstance(season, dict):
+            continue
+
+        # 1) Prefer explicit member summary when available (usually for latest season)
+        members = season.get("members")
+        if isinstance(members, list):
+            for m in members:
+                if not isinstance(m, dict):
+                    continue
+                if _norm_tag(m.get("tag")) != tag:
+                    continue
+                total_attacks += int(m.get("attacks", 0) or 0)
+                total_looted += int(m.get("capitalResourcesLooted", 0) or 0)
+                counted += 1
+                break
+
+        # 2) Fallback: parse attackLog to count attacks for this attacker (works for older seasons too)
+        attack_log = season.get("attackLog")
+        if isinstance(attack_log, list):
+            for base in attack_log:
+                if not isinstance(base, dict):
+                    continue
+                districts = base.get("districts") or []
+                if not isinstance(districts, list):
+                    continue
+                for d in districts:
+                    if not isinstance(d, dict):
+                        continue
+                    attacks = d.get("attacks") or []
+                    if not isinstance(attacks, list):
+                        continue
+                    # district loot is total; we attribute proportionally to attacks (best-effort)
+                    district_loot = int(d.get("totalLooted", 0) or 0)
+                    district_total_attacks = max(1, int(d.get("attackCount", len(attacks)) or len(attacks) or 1))
+                    for a in attacks:
+                        if not isinstance(a, dict):
+                            continue
+                        attacker = a.get("attacker") or {}
+                        if not isinstance(attacker, dict):
+                            continue
+                        if _norm_tag(attacker.get("tag")) != tag:
+                            continue
+                        total_attacks += 1
+                        total_attack_rows += 1
+                        total_stars += int(a.get("stars", 0) or 0)
+                        total_destr += int(a.get("destructionPercent", a.get("destructionPercentage", 0)) or 0)
+                        # proportional loot
+                        total_looted += int(round(district_loot / district_total_attacks))
+
+    avg_stars = (total_stars / total_attack_rows) if total_attack_rows else 0.0
+    avg_destr = (total_destr / total_attack_rows) if total_attack_rows else 0.0
+    return {
+        "attacks": total_attacks,
+        "loot": total_looted,
+        "seasons": counted,
+        "avg_stars": avg_stars,
+        "avg_destr": avg_destr,
+    }
+
+
+def _get_cwl_wars_for_clan() -> list[dict]:
+    """
+    Fetch CWL group and wars for this season (best-effort).
+    """
+    group = get_cwl_group()
+    if not isinstance(group, dict) or group.get("_error"):
+        return []
+    rounds = group.get("rounds", []) or []
+    war_tags: list[str] = []
+    for r in rounds:
+        if not isinstance(r, dict):
+            continue
+        for wt in (r.get("warTags") or []):
+            if isinstance(wt, str) and wt and wt != "#0":
+                war_tags.append(wt)
+    wars: list[dict] = []
+    for wt in war_tags:
+        war = get_cwl_war(wt)
+        if isinstance(war, dict) and not war.get("_error"):
+            wars.append(war)
+    return wars
+
+
+def _cwl_player_stats(wars: list[dict], player_tag: str) -> dict:
+    tag = _norm_tag(player_tag)
+    our_tag = _norm_tag(CLAN_TAG)
+    used = 0
+    possible = 0
+    stars = 0
+    destr = 0
+    attacks_rows = 0
+    missed = 0
+
+    for war in wars:
+        if not isinstance(war, dict):
+            continue
+        state = str(war.get("state", ""))
+        if state not in {"preparation", "inWar", "warEnded"}:
+            continue
+        apm = int(war.get("attacksPerMember", 2) or 2)
+        clan_obj = war.get("clan") or {}
+        opp_obj = war.get("opponent") or {}
+        ctag = _norm_tag((clan_obj or {}).get("tag"))
+        our_side = clan_obj if ctag == our_tag else opp_obj
+        mems = (our_side or {}).get("members") or []
+        if not isinstance(mems, list):
+            continue
+        member = None
+        for m in mems:
+            if isinstance(m, dict) and _norm_tag(m.get("tag")) == tag:
+                member = m
+                break
+        if not member:
+            continue
+        attacks = member.get("attacks") or []
+        if not isinstance(attacks, list):
+            attacks = []
+        used_here = len(attacks)
+        used += used_here
+        possible += apm
+        missed += max(0, apm - used_here)
+        for a in attacks:
+            if not isinstance(a, dict):
+                continue
+            stars += int(a.get("stars", 0) or 0)
+            destr += int(a.get("destructionPercentage", 0) or 0)
+            attacks_rows += 1
+
+    avg_stars = (stars / attacks_rows) if attacks_rows else 0.0
+    avg_destr = (destr / attacks_rows) if attacks_rows else 0.0
+    if possible <= 0:
+        score = 0
+    else:
+        used_ratio = used / possible
+        score = int(
+            max(
+                0,
+                min(
+                    100,
+                    round(used_ratio * 55 + (avg_stars / 3) * 25 + (avg_destr / 100) * 20),
+                ),
+            )
+        )
+    return {
+        "used": used,
+        "possible": possible,
+        "missed": missed,
+        "avg_stars": avg_stars,
+        "avg_destr": avg_destr,
+        "score": score,
+        "wars_count": len(wars),
+    }
+
+
+def _compute_player_scores(
+    player: dict,
+    member: dict | None,
+    raid_seasons: dict | None,
+    cwl_stats: dict | None,
+) -> tuple[dict[str, int], str]:
+    """
+    Returns (scores, context_label)
+    """
+    context_label = "Свежие данные по кнопке «Обновить»"
+
+    # Development completion
+    troops = player.get("troops") or []
+    spells = player.get("spells") or []
+    heroes = player.get("heroes") or []
+    pets = player.get("pets") or []
+    equipment = player.get("heroEquipment") or player.get("equipment") or []
+    if not isinstance(troops, list):
+        troops = []
+    if not isinstance(spells, list):
+        spells = []
+    if not isinstance(heroes, list):
+        heroes = []
+    if not isinstance(pets, list):
+        pets = []
+    if not isinstance(equipment, list):
+        equipment = []
+
+    tr_n, tr_d = _completion_ratio(troops, village="home")
+    sp_n, sp_d = _completion_ratio(spells, village="home")
+    he_n, he_d = _completion_ratio(heroes, village="home")
+    pe_n, pe_d = _completion_ratio(pets, village=None)
+    eq_n, eq_d = _completion_ratio(equipment, village=None)
+
+    dev_num = he_n * 3 + tr_n * 2 + sp_n * 1.5 + pe_n * 1.5 + eq_n * 2
+    dev_den = he_d * 3 + tr_d * 2 + sp_d * 1.5 + pe_d * 1.5 + eq_d * 2
+    base_dev = _score_percent(dev_num, dev_den) if dev_den > 0 else 0
+    # Slight uplift to avoid "too low" feel for mid accounts, but still capped.
+    development = int(min(100, round(base_dev * 0.90 + 10)))
+
+    # Builder base score
+    bh = int(player.get("builderHallLevel", 0) or 0)
+    bb_trophies = int(player.get("builderBaseTrophies", player.get("versusTrophies", 0)) or 0)
+    bb_wins = int(player.get("versusBattleWins", 0) or 0)
+    # scale: BH 1..11+, trophies 0..6000, wins 0..5000
+    bb_score = int(
+        max(
+            0,
+            min(
+                100,
+                round(min(1.0, bh / 11) * 35 + min(1.0, bb_trophies / 6000) * 45 + min(1.0, bb_wins / 2500) * 20),
+            ),
+        )
+    )
+
+    # Capital raids score (last ~3 seasons)
+    cap = _capital_member_from_seasons(raid_seasons, str(player.get("tag", "")), max_items=10)
+    cap_attacks = int(cap.get("attacks", 0) or 0)
+    cap_loot = int(cap.get("loot", 0) or 0)
+    cap_avg_destr = float(cap.get("avg_destr", 0.0) or 0.0)
+    # Attacks: ~0..18 (3 weekends), plus quality signal from average destruction.
+    cap_score = int(
+        max(
+            0,
+            min(
+                100,
+                round(
+                    min(1.0, cap_attacks / 18) * 60
+                    + min(1.0, cap_loot / 120000) * 25
+                    + min(1.0, cap_avg_destr / 100) * 15
+                ),
+            ),
+        )
+    )
+
+    # Donations (seasonal)
+    don = int(player.get("donations", 0) or 0)
+    rec = int(player.get("donationsReceived", 0) or 0)
+    donation_score = int(min(100, round((don / 1200) * 100))) if don > 0 else 0
+    # bonus for positive ratio
+    ratio_bonus = 0
+    if don + rec > 0:
+        ratio_bonus = int(round((don / (don + rec)) * 25))
+    donation_score = max(0, min(100, donation_score + ratio_bonus))
+
+    # War score (lifetime, since API doesn't provide full per-war details for normal wars)
+    war_stars = int(player.get("warStars", 0) or 0)
+    base_war = int(max(0, min(100, round(min(1.0, war_stars / 3000) * 100))))
+    cwl_score = int((cwl_stats or {}).get("score", 0) or 0) if isinstance(cwl_stats, dict) else 0
+    war_score = int(round(base_war * 0.65 + cwl_score * 0.35)) if cwl_score else base_war
+
+    # Activity (best-effort)
+    attack_wins = int(player.get("attackWins", 0) or 0)
+    defense_wins = int(player.get("defenseWins", 0) or 0)
+    activity = int(
+        max(
+            0,
+            min(
+                100,
+                round(
+                    min(1.0, war_stars / 1200) * 35
+                    + min(1.0, attack_wins / 3000) * 55
+                    + min(1.0, defense_wins / 1200) * 10
+                ),
+            ),
+        )
+    )
+
+    scores = {
+        "Главная деревня": development,
+        "Войны": war_score,
+        "Стройбаза": bb_score,
+        "Столица": cap_score,
+        "Активность": activity,
+        "Донаты": donation_score,
+    }
+    return scores, context_label
+
+
+async def _build_and_send_player_report(
+    bot: Bot,
+    chat_id: int,
+    player_tag: str,
+    reply_to_message: Message | None = None,
+    edit_message_id: int | None = None,
+    progress_message: Message | None = None,
+) -> int | None:
+    """
+    Builds report (data -> image -> caption). If edit_message_id is provided, edits that photo message.
+    Returns message_id of the report message (photo).
+    """
+    def _bar(step: int, total: int, width: int = 14) -> str:
+        total = max(1, int(total))
+        step = max(0, min(int(step), total))
+        filled = int(round((step / total) * width))
+        filled = max(0, min(width, filled))
+        return "|" + ("🟥" * filled) + ("⬛" * (width - filled)) + "|"
+
+    async def _progress(step: int, total: int, label: str) -> None:
+        if not progress_message:
+            return
+        try:
+            await progress_message.edit_text(
+                f"⏳ <b>Готовлю отчёт</b>\n\n{_bar(step, total)}\n<i>{_safe(label)}</i>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
+    total_steps = 6
+    await _progress(0, total_steps, "Собираю данные игрока…")
+
+    tag = _norm_tag(player_tag)
+    player = await _api(get_player_info, tag)
+    err = check_api_error(player, context="player stats report")
+    if err:
+        if reply_to_message:
+            await _edit_or_send(reply_to_message, err, main_menu_keyboard())
+        return None
+
+    await _progress(1, total_steps, "Проверяю клан…")
+    await asyncio.sleep(2.5)
+
+    # Clan members to get role/name consistency
+    members_data = await _api(get_clan_members, CLAN_TAG)
+    members_err = check_api_error(members_data, context="player stats clan members")
+    members = (members_data or {}).get("items", []) if isinstance(members_data, dict) else []
+    member = None
+    if isinstance(members, list):
+        for m in members:
+            if isinstance(m, dict) and _norm_tag(m.get("tag")) == tag:
+                member = m
+                break
+
+    await _progress(2, total_steps, "Собираю данные по столице…")
+    await asyncio.sleep(2.5)
+    raids = await _api(get_capital_raid_seasons, 10)
+    raids_err = check_api_error(raids, context="player stats capital raids")
+    if raids_err:
+        raids = None
+
+    await _progress(3, total_steps, "Собираю историю войн…")
+    await asyncio.sleep(2.5)
+    cwl_wars = await asyncio.to_thread(_get_cwl_wars_for_clan)
+    cwl_stats = _cwl_player_stats(cwl_wars, tag)
+
+    await _progress(4, total_steps, "Считаю оценки…")
+    await asyncio.sleep(0.3)
+    scores, context_label = _compute_player_scores(player or {}, member, raids, cwl_stats)
+
+    # Header
+    pname = _safe((player or {}).get("name", "Игрок"))
+    th = (player or {}).get("townHallLevel", "—")
+    league = _safe(((player or {}).get("league") or {}).get("name", "—"))
+    trophies = format_number((player or {}).get("trophies"))
+    updated = datetime.now(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    title = "Статистика игрока"
+    parts: list[str] = [pname, f"ТХ {th}", f"🏆 {trophies}"]
+    if league and league not in {"—", "Без лиги"}:
+        parts.append(league)
+    subtitle = " • ".join(parts)
+
+    await _progress(5, total_steps, "Рисую картинку…")
+    img_bytes = await asyncio.to_thread(
+        render_player_report_image,
+        title,
+        subtitle,
+        scores,
+        updated,
+    )
+
+    cap = _capital_member_from_seasons(raids if isinstance(raids, dict) else None, tag, max_items=10)
+    cap_attacks = int(cap.get("attacks", 0) or 0)
+    cap_loot = format_number(cap.get("loot"))
+    cap_seasons = int(cap.get("seasons", 0) or 0)
+    if cap_seasons > 0:
+        capital_line = f"🏚️ Столица: атаки <b>{cap_attacks}</b> • лут <b>{cap_loot}</b> (посл. {cap_seasons} сезона)"
+    else:
+        capital_line = "🏚️ Столица: <i>нет данных за последние сезоны</i>"
+
+    cwl_used = int((cwl_stats or {}).get("used", 0) or 0) if isinstance(cwl_stats, dict) else 0
+    cwl_possible = int((cwl_stats or {}).get("possible", 0) or 0) if isinstance(cwl_stats, dict) else 0
+    cwl_missed = int((cwl_stats or {}).get("missed", 0) or 0) if isinstance(cwl_stats, dict) else 0
+    cwl_avg_stars = float((cwl_stats or {}).get("avg_stars", 0.0) or 0.0) if isinstance(cwl_stats, dict) else 0.0
+    cwl_avg_destr = float((cwl_stats or {}).get("avg_destr", 0.0) or 0.0) if isinstance(cwl_stats, dict) else 0.0
+    if cwl_possible > 0:
+        cwl_line = (
+            f"🏅 ЛВК (сезон): атаки <b>{cwl_used}/{cwl_possible}</b>"
+            f" • пропуски <b>{cwl_missed}</b>"
+            f" • ср.звёзды <b>{cwl_avg_stars:.2f}</b>"
+            f" • ср.% <b>{cwl_avg_destr:.0f}%</b>"
+        )
+    else:
+        cwl_line = "🏅 ЛВК (сезон): <i>данных нет</i>"
+
+    caption = build_player_report_caption(
+        player or {},
+        member,
+        context_label,
+        scores,
+        capital_line,
+        cwl_line,
+        updated,
+    )
+
+    await _progress(6, total_steps, "Готово.")
+
+    tag_compact = tag.lstrip("#")
+    kb = player_report_keyboard(tag_compact)
+
+    if edit_message_id is not None:
+        media = InputMediaPhoto(
+            media=BufferedInputFile(img_bytes, filename=f"player_{tag_compact}.png"),
+            caption=caption,
+            parse_mode="HTML",
+        )
+        await bot.edit_message_media(
+            chat_id=chat_id,
+            message_id=edit_message_id,
+            media=media,
+            reply_markup=kb,
+        )
+        return edit_message_id
+
+    sent = await bot.send_photo(
+        chat_id=chat_id,
+        photo=BufferedInputFile(img_bytes, filename=f"player_{tag_compact}.png"),
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    return sent.message_id
 
 
 def build_war_text(data: dict) -> str:
@@ -1830,6 +2637,84 @@ async def cb_leaders(query: CallbackQuery) -> None:
         return
     members: list[dict] = data.get("items", [])
     await _edit_or_send(query.message, build_leaders_text(members), main_menu_keyboard())
+
+
+@router_dp.callback_query(F.data == "menu:pstats")
+async def cb_player_stats_menu(query: CallbackQuery) -> None:
+    await query.answer()
+    data = await _api(get_clan_members, CLAN_TAG)
+    err = check_api_error(data, context="player stats list")
+    if err:
+        await _edit_or_send(query.message, err, main_menu_keyboard())
+        return
+    members: list[dict] = (data or {}).get("items", []) if isinstance(data, dict) else []
+    text, kb = player_stats_select_text_and_kb(members if isinstance(members, list) else [])
+    await _edit_or_send(query.message, text, kb)
+
+
+@router_dp.callback_query(F.data.startswith("pstats:pick:"))
+async def cb_player_stats_pick(query: CallbackQuery) -> None:
+    await query.answer()
+    raw = str(query.data or "")
+    parts = raw.split(":")
+    if len(parts) < 3:
+        return
+    tag_compact = parts[2].strip().upper()
+    player_tag = "#" + tag_compact.lstrip("#")
+
+    key = (query.message.chat.id, tag_compact)
+
+    status = await query.message.answer("⏳ <b>Готовлю отчёт</b>\n\n|⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛|\n<i>Старт…</i>", parse_mode="HTML")
+    try:
+        msg_id = await _build_and_send_player_report(
+            query.bot,
+            chat_id=query.message.chat.id,
+            player_tag=player_tag,
+            reply_to_message=status,
+            progress_message=status,
+        )
+        await status.delete()
+    except Exception:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+
+@router_dp.callback_query(F.data.startswith("pstats:refresh:"))
+async def cb_player_stats_refresh(query: CallbackQuery) -> None:
+    await query.answer()
+    raw = str(query.data or "")
+    parts = raw.split(":")
+    if len(parts) < 3:
+        return
+    tag_compact = parts[2].strip().upper()
+    player_tag = "#" + tag_compact.lstrip("#")
+
+    status: Message | None = None
+    try:
+        status = await query.message.answer(
+            "⏳ <b>Обновляю отчёт</b>\n\n|⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛|\n<i>Старт…</i>",
+            parse_mode="HTML",
+        )
+        await _build_and_send_player_report(
+            query.bot,
+            chat_id=query.message.chat.id,
+            player_tag=player_tag,
+            edit_message_id=query.message.message_id,
+            progress_message=status,
+        )
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("Refresh player stats failed: %s", exc)
+        if status:
+            try:
+                await status.delete()
+            except Exception:
+                pass
 
 
 @router_dp.callback_query(F.data == "menu:notify")
