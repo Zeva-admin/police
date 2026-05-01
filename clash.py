@@ -13,6 +13,7 @@ from urllib.parse import quote
 import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -1428,7 +1429,7 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
     Periodically sends reminders to a group chat about missing attacks in war/CWL.
     """
     poll_seconds = 300  # 5 minutes
-    min_repeat_seconds = 1800  # 30 minutes (avoid same message too often)
+    min_repeat_seconds = 900  # 15 minutes (avoid same message too often)
     last_fingerprint: str | None = None
     last_sent_at: float = 0.0
 
@@ -1450,37 +1451,56 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
                     context = "КВ"
                     title, missing, state, end_time = get_war_missing_attacks(war, CLAN_TAG)
 
-            # Stop if nothing active
-            if not context or state not in {"preparation", "inWar"}:
-                await asyncio.sleep(poll_seconds)
-                continue
-
-            # During preparation attacks are impossible; remind only when the battle is live.
-            if state == "preparation":
-                await asyncio.sleep(poll_seconds)
-                continue
-
-            if not missing:
-                await asyncio.sleep(poll_seconds)
-                continue
-
+            # Build status text (always keep one message alive and updated)
             time_left = _time_left(end_time)
-            missing_block = "\n".join(f"{i}. {line}" for i, line in enumerate(missing[:25], start=1))
-            if len(missing) > 25:
-                missing_block += f"\n…и ещё <b>{len(missing) - 25}</b>"
+            state_label = "подготовка" if state == "preparation" else ("война" if state == "inWar" else "—")
 
-            state_label = "подготовка" if state == "preparation" else "война"
+            if not context or state not in {"preparation", "inWar"}:
+                header = "🔔 <b>Уведомления активны</b>"
+                body = (
+                    "Сейчас активных войн нет.\n"
+                    "<i>Я проверяю обстановку автоматически и обновляю это сообщение.</i>"
+                )
+                fingerprint = f"idle|{state}"
+            elif state == "preparation":
+                header = f"🔔 <b>{context}: идёт подготовка</b>"
+                body = (
+                    f"Осталось до начала: <b>{_safe(time_left)}</b>\n\n"
+                    "Как только начнётся война, я буду напоминать тем, кто ещё не атаковал."
+                )
+                fingerprint = f"prep|{context}|{end_time}"
+            elif not missing:
+                header = f"🔔 <b>{context}: всё спокойно</b>"
+                body = (
+                    f"Сейчас: <b>{state_label}</b>\n"
+                    f"Осталось: <b>{_safe(time_left)}</b>\n\n"
+                    "По нашим — все атаки сделаны."
+                )
+                fingerprint = f"ok|{context}|{state}|{end_time}"
+            else:
+                missing_block = "\n".join(
+                    f"{i}. {line}" for i, line in enumerate(missing[:25], start=1)
+                )
+                if len(missing) > 25:
+                    missing_block += f"\n…и ещё <b>{len(missing) - 25}</b>"
+
+                header = f"🔔 <b>{context}: сделайте атаки</b>"
+                body = (
+                    f"Сейчас: <b>{state_label}</b>\n"
+                    f"Осталось: <b>{_safe(time_left)}</b>\n"
+                    f"В списке: <b>{len(missing)}</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "<b>Кому ещё нужно атаковать:</b>\n"
+                    f"{missing_block}"
+                )
+                fingerprint = f"need|{context}|{state}|{end_time}|{';'.join(missing)}"
+
             text = (
-                f"🔔 <b>{context}: напоминание</b>\n"
-                f"Сейчас: <b>{state_label}</b>\n"
-                f"Осталось: <b>{_safe(time_left)}</b>\n"
-                f"В списке: <b>{len(missing)}</b>\n"
+                f"{header}\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "<b>Кому ещё нужно атаковать:</b>\n"
-                f"{missing_block}\n\n"
-                "<i>Сообщение обновляется само — новых сообщений в чат не будет.</i>"
+                f"{body}\n\n"
+                "<i>Это сообщение обновляется само — без спама в чат.</i>"
             )
-            fingerprint = f"{context}|{state}|{end_time}|{';'.join(missing)}"
 
             now = time.time()
             should_send = False
@@ -1847,9 +1867,41 @@ async def cb_notify(query: CallbackQuery) -> None:
         _notify_tasks.pop(target_chat_id, None)
         return
 
+    # Try to post (or create) a single status message in target chat immediately
+    try:
+        if target_chat_id not in _notify_message_ids:
+            sent = await bot.send_message(
+                target_chat_id,
+                "🔔 <b>Уведомления активны</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Я буду обновлять это сообщение и напоминать про атаки.\n\n"
+                "<i>Без спама в чат — только обновление одного сообщения.</i>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            _notify_message_ids[target_chat_id] = sent.message_id
+    except (TelegramForbiddenError, TelegramBadRequest) as exc:
+        logger.warning("Cannot post notify status to chat %s: %s", target_chat_id, exc)
+        # Stop task if we can't write there
+        _notify_tasks[target_chat_id].cancel()
+        _notify_tasks.pop(target_chat_id, None)
+        _notify_message_ids.pop(target_chat_id, None)
+        await _edit_or_send(
+            query.message,
+            "⚠️ <b>Не получилось включить уведомления</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Я не могу писать в выбранный чат.\n\n"
+            "Проверь:\n"
+            "• бот добавлен в группу\n"
+            "• у бота есть право отправлять сообщения\n"
+            "• если включены ограничения — разреши отправку сообщений",
+            main_menu_keyboard(),
+        )
+        return
+
     text = (
         "🔔 <b>Уведомления включены</b>\n\n"
-        f"Чат: <code>{target_chat_id}</code>\n"
+        "Теперь я буду писать напоминания в клановый чат (одним обновляемым сообщением).\n\n"
         "<i>Нажми кнопку ещё раз, чтобы выключить.</i>"
     )
     await _edit_or_send(query.message, text, main_menu_keyboard())
