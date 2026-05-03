@@ -30,7 +30,7 @@ try:
 except Exception:  
     clashapi = None
 
-TELEGRAM_BOT_TOKEN: str = "8475734533:AAE9YL9X2pCbxADV79w6v2KloDTEI9Yx7WE"
+TELEGRAM_BOT_TOKEN: str = "8475734533:AAGKGG72h0KyFWfhzvc2BPj-ZtZ9xBOGWUU"
 
 # Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
