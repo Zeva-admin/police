@@ -26,37 +26,24 @@ from aiogram.types import (
 from PIL import Image, ImageDraw, ImageFont
 
 try:
-    import clashapi  # required for dynamic IP setups
-except Exception:  # pragma: no cover
+    import clashapi 
+except Exception:  
     clashapi = None
 
-# ============================================================
-# SECTION: CONFIG (hardcoded, no .env)
-# ============================================================
-
-# Telegram bot token (hardcoded as requested)
 TELEGRAM_BOT_TOKEN: str = "8475734533:AAE9YL9X2pCbxADV79w6v2KloDTEI9Yx7WE"
 
 # Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
 CLASH_PASSWORD: str = "My happy life43"
 
-# Default clan tag (set yours here). You can still override per-command:
-# /clan #TAG, /members #TAG, /war #TAG, etc.
 CLAN_TAG: str = "#2GYQ8VJV2"
 
-# Clan display name for UI (set your clan name here, e.g. "В.К.Л")
 CLAN_DISPLAY_NAME: str = "В.К.Л"
 
-# Cached clan name from the game (filled on startup/reset when available)
 _CLAN_NAME_CACHED: str | None = None
+_CLAN_WARLEAGUE_CACHED: str | None = None
 
-# Who can use admin commands (like /reset). Set your Telegram user id here.
 OWNER_USER_ID: int = 7053001262
-
-# Target chat id for clan group notifications (set your group/supergroup id here).
-# Example: -1001234567890
-# If set to 0, bot uses the chat where you pressed "🔔 Уведомления".
 CHAT_ID: int = -1002552886756
 
 # Local time formatting for UI (UTC offset). Ashgabat is UTC+5.
@@ -76,6 +63,9 @@ _clash_token_source: str = "unset"  # "clashapi" | "unset"
 # Notification tasks per chat (group/supergroup)
 _notify_tasks: dict[int, asyncio.Task] = {}
 _notify_message_ids: dict[int, int] = {}
+
+# Auto broadcast tasks (war/CWL milestone notifications)
+_broadcast_tasks: dict[int, asyncio.Task] = {}
 
 SHUTDOWN_EVENT = asyncio.Event()
 
@@ -758,6 +748,16 @@ def _safe(s: object) -> str:
     return html.escape(str(s)) if s is not None else ""
 
 
+def _extract_clan_war_league_name(clan_info: dict | None) -> str | None:
+    if not isinstance(clan_info, dict):
+        return None
+    wl = clan_info.get("warLeague") or {}
+    if not isinstance(wl, dict):
+        return None
+    name = str(wl.get("name") or "").strip()
+    return name or None
+
+
 def _is_owner(message: Message) -> bool:
     try:
         return bool(message.from_user) and int(message.from_user.id) == int(OWNER_USER_ID)
@@ -827,6 +827,29 @@ def _time_left(end_ts: str | None) -> str:
         return "—"
     now = datetime.now(timezone.utc)
     delta = end_dt - now
+    seconds = int(delta.total_seconds())
+    if seconds <= 0:
+        return "0м"
+    minutes = seconds // 60
+    hours = minutes // 60
+    days = hours // 24
+    minutes = minutes % 60
+    hours = hours % 24
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}д")
+    if hours:
+        parts.append(f"{hours}ч")
+    parts.append(f"{minutes}м")
+    return " ".join(parts)
+
+
+def _time_until(ts: str | None) -> str:
+    dt = _parse_coc_time(ts)
+    if not dt:
+        return "—"
+    now = datetime.now(timezone.utc)
+    delta = dt - now
     seconds = int(delta.total_seconds())
     if seconds <= 0:
         return "0м"
@@ -1777,10 +1800,14 @@ async def _build_and_send_player_report(
     return sent.message_id
 
 
-def build_war_text(data: dict) -> str:
+def build_war_text(data: dict, *, mode: str = "war", include_title: bool = True) -> str:
     state = str(data.get("state", "notInWar"))
     team_size = data.get("teamSize", "—")
-    attacks_per_member = int(data.get("attacksPerMember", 2) or 2)
+    default_apm = 1 if mode == "cwl" else 2
+    attacks_per_member = int(data.get("attacksPerMember", default_apm) or default_apm)
+    if mode == "cwl":
+        # В ЛВК всегда 1 атака на участника за день войны
+        attacks_per_member = 1
 
     our = data.get("clan", {}) or {}
     opp = data.get("opponent", {}) or {}
@@ -1872,8 +1899,7 @@ def build_war_text(data: dict) -> str:
             f" • Соперник <b>{opp_attacks}/{total_attacks}</b> (осталось {opp_left})"
         )
 
-    return (
-        "⚔️ <b>Война</b>\n\n"
+    body = (
         f"Тег клана: <code>{_safe(CLAN_TAG)}</code>\n"
         f"Статус: <b>{_safe(_normalize_state_label(state))}</b>\n"
         f"Формат: <b>{team_size}×{team_size}</b> • атак на участника: <b>{attacks_per_member}</b>\n"
@@ -1886,6 +1912,14 @@ def build_war_text(data: dict) -> str:
         f"{missing_block}"
         f"{last_attacks_block}"
     )
+    if not include_title:
+        return body
+    title = (
+        "🏅 <b>ЛВК — Война</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        if mode == "cwl"
+        else "⚔️ <b>Война</b>\n\n"
+    )
+    return title + body
 
 
 def build_leaders_text(members: list[dict]) -> str:
@@ -2229,6 +2263,239 @@ def get_war_missing_attacks(war: dict, clan_tag: str) -> tuple[str, list[str], s
             missing_lines.append(f"<b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
 
     return "Война", missing_lines, state, end_time
+
+
+def _war_sides(war: dict, clan_tag: str) -> tuple[dict, dict]:
+    clan = war.get("clan", {}) or {}
+    opp = war.get("opponent", {}) or {}
+    our_tag = _norm_tag(clan_tag)
+    ctag = _norm_tag(clan.get("tag"))
+    if ctag == our_tag:
+        return clan, opp
+    otag = _norm_tag(opp.get("tag"))
+    if otag == our_tag:
+        return opp, clan
+    return clan, opp
+
+
+def _war_id_kv(war: dict) -> str:
+    start_time = str(war.get("startTime") or "")
+    opp_tag = _norm_tag(((war.get("opponent") or {}).get("tag"))).lstrip("#")
+    return f"kv|{start_time}|{opp_tag}"
+
+
+def _war_result_label(our: dict, opp: dict) -> str:
+    our_stars = int(our.get("stars", 0) or 0)
+    opp_stars = int(opp.get("stars", 0) or 0)
+    if our_stars != opp_stars:
+        return "Победа" if our_stars > opp_stars else "Поражение"
+    our_d = float(our.get("destructionPercentage", 0.0) or 0.0)
+    opp_d = float(opp.get("destructionPercentage", 0.0) or 0.0)
+    if abs(our_d - opp_d) >= 0.01:
+        return "Победа" if our_d > opp_d else "Поражение"
+    return "Ничья"
+
+
+def _format_missing_block(missing: list[str], limit: int = 20) -> str:
+    if not missing:
+        return "✅ Все атаки сделаны."
+    block = "\n".join(f"{i}. {line}" for i, line in enumerate(missing[:limit], start=1))
+    if len(missing) > limit:
+        block += f"\n…и ещё <b>{len(missing) - limit}</b>"
+    return "Кому ещё нужно атаковать:\n" + block
+
+
+async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
+    """
+    Auto broadcasts war/CWL milestone notifications as NEW messages:
+    - start
+    - ~1/3 passed
+    - ~2/3 passed
+    - last hour
+    - end result
+    """
+    # Polling interval: keeps bot within ~2–3 minutes freshness while being gentle to API.
+    poll_seconds = 150  # 2.5 minutes
+
+    active_id: str | None = None
+    active_kind: str | None = None  # "КВ" | "ЛВК"
+    active_war_tag: str | None = None
+    sent: set[str] = set()
+    # CWL full scan (leaguegroup + wars) is expensive. Do it редко.
+    cwl_scan_cooldown_seconds = 600  # 10 минут
+    cwl_next_scan_at: float = 0.0
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+
+            kind = ""
+            war: dict | None = None
+            war_id = ""
+            war_tag = None
+
+            # Try to keep CWL checks cheap:
+            # - if we already know the current CWL war tag, check it first (1 request)
+            # - otherwise, do a full scan (leaguegroup + multiple wars) only every ~10 minutes
+            cwl_tag: str | None = None
+            cwl_war: dict | None = None
+            if active_kind == "ЛВК" and active_war_tag:
+                cw = await asyncio.to_thread(get_cwl_war, active_war_tag)
+                if isinstance(cw, dict) and not cw.get("_error") and str(cw.get("state", "")) in {
+                    "preparation",
+                    "inWar",
+                    "warEnded",
+                }:
+                    cwl_tag, cwl_war = active_war_tag, cw
+                else:
+                    # War tag is stale — allow scan soon
+                    active_war_tag = None
+                    active_kind = None
+
+            if not cwl_tag and time.time() >= cwl_next_scan_at:
+                cwl_tag, cwl_war = await asyncio.to_thread(get_current_cwl_war_for_clan)
+                cwl_next_scan_at = time.time() + cwl_scan_cooldown_seconds
+            if cwl_tag and isinstance(cwl_war, dict) and not cwl_war.get("_error"):
+                kind = "ЛВК"
+                war = cwl_war
+                war_tag = str(cwl_tag)
+                war_id = f"cwl|{_norm_tag(war_tag)}"
+            else:
+                kv = await asyncio.to_thread(get_current_war, CLAN_TAG)
+                if isinstance(kv, dict) and not kv.get("_error"):
+                    kind = "КВ"
+                    war = kv
+                    war_id = _war_id_kv(kv)
+
+            # No active war/prep
+            if not kind or not isinstance(war, dict):
+                active_id = None
+                active_kind = None
+                active_war_tag = None
+                sent.clear()
+                await asyncio.sleep(poll_seconds)
+                continue
+
+            state = str(war.get("state", "notInWar"))
+            if state not in {"preparation", "inWar", "warEnded"}:
+                await asyncio.sleep(poll_seconds)
+                continue
+
+            # Switch to a new war instance
+            if war_id != active_id:
+                active_id = war_id
+                active_kind = kind
+                active_war_tag = war_tag
+                sent.clear()
+
+            our, opp = _war_sides(war, CLAN_TAG)
+            opp_name = _safe(opp.get("name", "соперник"))
+            team_size = war.get("teamSize", "—")
+
+            # Timing
+            start_dt = _parse_coc_time(str(war.get("startTime") or ""))
+            end_dt = _parse_coc_time(str(war.get("endTime") or ""))
+            if not start_dt or not end_dt:
+                await asyncio.sleep(poll_seconds)
+                continue
+            duration = max(1, int((end_dt - start_dt).total_seconds()))
+            elapsed = int((now - start_dt).total_seconds())
+            remaining = int((end_dt - now).total_seconds())
+
+            # Missing list (only meaningful inWar)
+            attacks_per_member = 1 if kind == "ЛВК" else int(war.get("attacksPerMember", 2) or 2)
+            missing_lines: list[str] = []
+            members = (our.get("members") or []) if isinstance(our.get("members"), list) else []
+            for m in members:
+                if not isinstance(m, dict):
+                    continue
+                used = len(m.get("attacks", []) or [])
+                if used < attacks_per_member:
+                    name = _safe(m.get("name", "—"))
+                    th = m.get("townhallLevel", m.get("townHallLevel", "?"))
+                    missing_lines.append(f"<b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
+
+            # Milestones
+            if state == "inWar":
+                time_left = _time_left(str(war.get("endTime") or ""))
+
+                # Send at most ONE reminder per loop tick (so it doesn't spam in bursts)
+                if "start" not in sent:
+                    text = (
+                        f"🔥 <b>{kind} началась!</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"Против: <b>{opp_name}</b>\n"
+                        f"Формат: <b>{team_size}×{team_size}</b> • атаки: <b>{attacks_per_member}</b>\n"
+                        f"До конца: <b>{_safe(time_left)}</b>\n\n"
+                        f"{_format_missing_block(missing_lines)}"
+                    )
+                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    sent.add("start")
+                elif remaining <= 3600 and remaining > 0 and "last_hour" not in sent:
+                    text = (
+                        f"🚨 <b>{kind}: последний час!</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"Осталось: <b>{_safe(time_left)}</b>\n\n"
+                        f"{_format_missing_block(missing_lines)}"
+                    )
+                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    sent.add("last_hour")
+                elif elapsed >= int(duration * 0.67) and "twothirds" not in sent and remaining > 3600:
+                    text = (
+                        f"⚠️ <b>{kind}: уже больше половины</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"До конца: <b>{_safe(time_left)}</b>\n\n"
+                        f"{_format_missing_block(missing_lines)}"
+                    )
+                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    sent.add("twothirds")
+                elif elapsed >= int(duration * 0.33) and "third" not in sent and remaining > 3600:
+                    text = (
+                        f"⏱️ <b>{kind}: прошло меньше половины</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"До конца: <b>{_safe(time_left)}</b>\n"
+                        f"Против: <b>{opp_name}</b>\n\n"
+                        f"{_format_missing_block(missing_lines)}"
+                    )
+                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    sent.add("third")
+
+            # 5) End result
+            if state == "warEnded" or remaining <= 0:
+                if "end" not in sent:
+                    # Refresh data for final numbers (especially CWL war)
+                    final_war = war
+                    if kind == "ЛВК" and active_war_tag:
+                        fw = await asyncio.to_thread(get_cwl_war, active_war_tag)
+                        if isinstance(fw, dict) and not fw.get("_error"):
+                            final_war = fw
+                    our_f, opp_f = _war_sides(final_war or {}, CLAN_TAG)
+                    result = _war_result_label(our_f, opp_f)
+                    our_stars = int(our_f.get("stars", 0) or 0)
+                    opp_stars = int(opp_f.get("stars", 0) or 0)
+                    our_d = float(our_f.get("destructionPercentage", 0.0) or 0.0)
+                    opp_d = float(opp_f.get("destructionPercentage", 0.0) or 0.0)
+                    text = (
+                        f"🏁 <b>{kind} завершилась</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"Итог: <b>{result}</b>\n"
+                        f"Счёт: ⭐ <b>{our_stars}</b>:<b>{opp_stars}</b> • 💥 <b>{our_d:.2f}%</b>:<b>{opp_d:.2f}%</b>"
+                    )
+                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    sent.add("end")
+
+                # After sending end, reset to avoid repeated posts
+                active_id = None
+                active_kind = None
+                active_war_tag = None
+                sent.clear()
+
+            await asyncio.sleep(poll_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Broadcast loop error for chat %s: %s", chat_id, exc)
+            await asyncio.sleep(poll_seconds)
 
 
 async def _notify_loop(bot: Bot, chat_id: int) -> None:
@@ -2724,10 +2991,9 @@ async def cb_notify(query: CallbackQuery) -> None:
     source_chat = query.message.chat
     target_chat_id = int(CHAT_ID) if isinstance(CHAT_ID, int) and CHAT_ID != 0 else source_chat.id
 
-    if target_chat_id in _notify_tasks and not _notify_tasks[target_chat_id].done():
-        _notify_tasks[target_chat_id].cancel()
-        _notify_tasks.pop(target_chat_id, None)
-        _notify_message_ids.pop(target_chat_id, None)
+    if target_chat_id in _broadcast_tasks and not _broadcast_tasks[target_chat_id].done():
+        _broadcast_tasks[target_chat_id].cancel()
+        _broadcast_tasks.pop(target_chat_id, None)
         text = (
             "🔕 <b>Уведомления выключены</b>\n\n"
             "Оповещения остановлены."
@@ -2736,8 +3002,8 @@ async def cb_notify(query: CallbackQuery) -> None:
         return
 
     bot = query.bot
-    task = asyncio.create_task(_notify_loop(bot, target_chat_id))
-    _notify_tasks[target_chat_id] = task
+    task = asyncio.create_task(_broadcast_milestones_loop(bot, target_chat_id))
+    _broadcast_tasks[target_chat_id] = task
 
     if getattr(source_chat, "type", "") not in {"group", "supergroup"} and target_chat_id == source_chat.id:
         text = (
@@ -2748,42 +3014,40 @@ async def cb_notify(query: CallbackQuery) -> None:
         )
         await _edit_or_send(query.message, text, main_menu_keyboard())
         # stop task started for private chat
-        _notify_tasks[target_chat_id].cancel()
-        _notify_tasks.pop(target_chat_id, None)
+        _broadcast_tasks[target_chat_id].cancel()
+        _broadcast_tasks.pop(target_chat_id, None)
         return
 
-    # Try to post (or create) a single status message in target chat immediately
+    # Quick permission check: try sending a short message once
     try:
-        if target_chat_id not in _notify_message_ids:
-            sent = await bot.send_message(
-                target_chat_id,
-                "🔔 <b>Уведомления активны</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Я буду обновлять это сообщение и напоминать про атаки.\n\n"
-                "<i>Без спама в чат — только обновление одного сообщения.</i>",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-            _notify_message_ids[target_chat_id] = sent.message_id
+        await bot.send_message(
+            target_chat_id,
+            "🔔 <b>Уведомления включены</b>\n\nБуду писать по ключевым моментам КВ/ЛВК.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
     except (TelegramForbiddenError, TelegramBadRequest) as exc:
-        logger.warning("Cannot post notify status to chat %s: %s", target_chat_id, exc)
-        # Stop task if we can't write there
-        _notify_tasks[target_chat_id].cancel()
-        _notify_tasks.pop(target_chat_id, None)
-        _notify_message_ids.pop(target_chat_id, None)
+        logger.warning("Cannot post broadcast to chat %s: %s", target_chat_id, exc)
+        _broadcast_tasks[target_chat_id].cancel()
+        _broadcast_tasks.pop(target_chat_id, None)
         await _edit_or_send(
             query.message,
             "⚠️ <b>Не получилось включить уведомления</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Я не могу писать в выбранный чат.\n\n"
+            "Похоже, я не могу писать в выбранный чат.\n\n"
             "Проверь:\n"
             "• бот добавлен в группу\n"
-            "• у бота есть право отправлять сообщения\n"
-            "• если включены ограничения — разреши отправку сообщений",
+            "• у бота есть право отправлять сообщения",
             main_menu_keyboard(),
         )
         return
 
+    await _edit_or_send(
+        query.message,
+        "🔔 <b>Уведомления включены</b>\n\n"
+        "Сообщения будут приходить отдельными постами — чтобы их точно заметили.",
+        main_menu_keyboard(),
+    )
     text = (
         "🔔 <b>Уведомления включены</b>\n\n"
         "Теперь я буду писать напоминания в клановый чат (одним обновляемым сообщением).\n\n"
@@ -2834,6 +3098,7 @@ async def cb_capital(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:cwl")
 async def cb_cwl(query: CallbackQuery) -> None:
     await query.answer()
+    global _CLAN_WARLEAGUE_CACHED
     data = await _api(get_cwl_group)
     if isinstance(data, dict) and data.get("_error") == "not_found":
         text = (
@@ -2855,14 +3120,29 @@ async def cb_cwl(query: CallbackQuery) -> None:
         text = (
             "🏅 <b>Лига войн клана (ЛВК)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Сейчас ЛВК <b>не идёт</b>."
+            "ЛВК сейчас <b>ещё не началась</b> или клан <b>не участвует</b>."
         )
         await _edit_or_send(query.message, text, main_menu_keyboard())
         return
 
-    league = data.get("league", {}) or {}
+    league = data.get("league") or data.get("clanWarLeague") or {}
     season = _safe(data.get("season", "—"))
-    league_name = _safe(league.get("name", "—"))
+    league_name_raw = ""
+    if isinstance(league, dict):
+        league_name_raw = str(league.get("name") or "").strip()
+    if not league_name_raw:
+        league_name_raw = str(data.get("leagueName") or "").strip()
+    if not league_name_raw:
+        league_name_raw = str((_CLAN_WARLEAGUE_CACHED or "")).strip()
+    if not league_name_raw:
+        clan_info = await _api(get_clan_info, CLAN_TAG)
+        info_err = check_api_error(clan_info, context="cwl clan info for warLeague")
+        if not info_err:
+            wl = _extract_clan_war_league_name(clan_info)
+            if wl:
+                _CLAN_WARLEAGUE_CACHED = wl
+                league_name_raw = wl
+    league_name = _safe(league_name_raw or "—")
     clans = data.get("clans", []) or []
     rounds = data.get("rounds", []) or []
 
@@ -2873,7 +3153,8 @@ async def cb_cwl(query: CallbackQuery) -> None:
         cname = _safe(c.get("name", "—"))
         ctag = _safe(c.get("tag", ""))
         lvl = c.get("clanLevel", "—")
-        clan_lines.append(f"• <b>{cname}</b> <code>{ctag}</code> (ур. {lvl})")
+        mark = "⭐ " if _norm_tag(ctag) == _norm_tag(CLAN_TAG) else ""
+        clan_lines.append(f"• {mark}<b>{cname}</b> <code>{ctag}</code> (ур. {lvl})")
 
     our_tag = _norm_tag(CLAN_TAG)
 
@@ -2899,27 +3180,35 @@ async def cb_cwl(query: CallbackQuery) -> None:
         opp_stars = int(opp_side.get("stars", 0) or 0)
         our_att = int(our_side.get("attacks", 0) or 0)
         team_size = war.get("teamSize", "—")
-        apm = int(war.get("attacksPerMember", 1) or 1)
-        total_att = int(team_size) * apm if str(team_size).isdigit() else None
+        total_att = int(team_size) * 1 if str(team_size).isdigit() else None
         left = (total_att - our_att) if isinstance(total_att, int) else None
 
-        left_str = f", осталось {left}" if left is not None else ""
-        round_lines.append(
-            f"• <b>Раунд {i}</b>: vs <b>{opp_name}</b> — ⭐ <b>{our_stars}</b>:<b>{opp_stars}</b> — {w_state_ru} (тег войны: <code>{_safe(war_tag)}</code>{left_str})"
+        state_icon = {"Подготовка": "🟡", "Война": "🟢", "Война завершена": "⚪"}.get(
+            w_state_ru, "🔹"
         )
+        left_str = f"{left}" if left is not None else "—"
+        total_str = f"{total_att}" if isinstance(total_att, int) else "—"
+        round_lines.append(
+            f"{state_icon} <b>Раунд {i}</b> • <b>{w_state_ru}</b> • vs <b>{opp_name}</b>\n"
+            f"   ⭐ <b>{our_stars}</b>:<b>{opp_stars}</b> • ⚔️ <b>{our_att}/{total_str}</b> (осталось {left_str}) • <code>{_safe(war_tag)}</code>"
+        )
+
+    group_block = "\n".join(clan_lines) if clan_lines else "<i>Нет данных.</i>"
+    rounds_block = "\n\n".join(round_lines) if round_lines else "<i>Нет данных.</i>"
 
     text = (
         "🏅 <b>Лига войн клана (ЛВК)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Сезон: <b>{season}</b>\n"
         f"Лига: <b>{league_name}</b>\n"
-        f"Статус группы: <b>{_safe(state)}</b>\n\n"
+        f"Статус: <b>{_safe(_normalize_state_label(state))}</b>\n"
+        "Формат: <b>1 атака</b> на участника в день войны\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>Группа:</b>\n"
-        + ("\n".join(clan_lines) if clan_lines else "<i>Нет данных.</i>")
-        + "\n\n"
-        "<b>Наши раунды:</b>\n"
-        + ("\n".join(round_lines) if round_lines else "<i>Нет данных.</i>")
+        "<b>Группа (8 кланов):</b>\n"
+        f"{group_block}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>Наши раунды</b> (кнопки снизу):\n\n"
+        f"{rounds_block}"
     )
     await _edit_or_send(query.message, text, cwl_rounds_keyboard(len(rounds)))
 
@@ -2969,8 +3258,10 @@ async def cb_cwl_round(query: CallbackQuery) -> None:
     # Reuse war renderer for full details
     text = (
         f"🏅 <b>ЛВК — Раунд {round_num}</b>\n"
-        f"Тег войны: <code>{_safe(war_tag)}</code>\n\n"
-        + build_war_text(war)
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Тег войны: <code>{_safe(war_tag)}</code>\n"
+        "Формат: <b>1 атака</b> на участника\n\n"
+        + build_war_text(war, mode="cwl", include_title=False)
     )
     await _edit_or_send(query.message, text, cwl_rounds_keyboard(len(rounds)))
 
@@ -3006,6 +3297,12 @@ async def handle_reset(message: Message) -> None:
         except Exception:
             pass
     _notify_tasks.clear()
+    for chat_id, task in list(_broadcast_tasks.items()):
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    _broadcast_tasks.clear()
 
     # Reset token cache
     global _clash_token, _clash_token_source
@@ -3449,6 +3746,15 @@ async def main() -> None:
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = router_dp
 
+    # Auto notifications for clan chat (new messages, milestone-based)
+    try:
+        if isinstance(CHAT_ID, int) and CHAT_ID != 0:
+            if CHAT_ID not in _broadcast_tasks or _broadcast_tasks[CHAT_ID].done():
+                _broadcast_tasks[CHAT_ID] = asyncio.create_task(_broadcast_milestones_loop(bot, CHAT_ID))
+                logger.info("Auto broadcast notifications enabled for chat %s", CHAT_ID)
+    except Exception:
+        pass
+
     def _shutdown() -> None:
         if not SHUTDOWN_EVENT.is_set():
             SHUTDOWN_EVENT.set()
@@ -3495,6 +3801,12 @@ async def main() -> None:
             except Exception:
                 pass
         _notify_tasks.clear()
+        for chat_id, task in list(_broadcast_tasks.items()):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        _broadcast_tasks.clear()
 
         server.close()
         await server.wait_closed()
