@@ -17,7 +17,12 @@ from urllib.parse import quote
 import requests
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramUnauthorizedError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramForbiddenError,
+    TelegramUnauthorizedError,
+)
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -96,6 +101,12 @@ _tg_links_cache_loaded_at: float = 0.0
 # Bot instance for WebApp handlers (set in main)
 _BOT_INSTANCE: Bot | None = None
 _BOT_USERNAME: str = ""
+
+# Render deploy overlap guard:
+# When two instances start at the same time, Telegram polling conflicts.
+# If Postgres (Supabase) is available, we use a session-level advisory lock so that
+# only one instance performs polling at a time.
+_poll_lock_conn: object | None = None
 
 # Local time formatting for UI (UTC offset). Ashgabat is UTC+5.
 LOCAL_UTC_OFFSET_HOURS: int = 5
@@ -997,6 +1008,57 @@ async def _pg_get_pool():
         command_timeout=10,
     )
     return _pg_pool
+
+
+async def _acquire_polling_lock() -> None:
+    """
+    Acquire a global advisory lock in Postgres to prevent multiple instances from polling Telegram.
+    This avoids TelegramConflictError during Render rolling deploys.
+    """
+    global _poll_lock_conn
+    if _poll_lock_conn is not None:
+        return
+    if asyncpg is None:
+        return
+    try:
+        pool = await _pg_get_pool()
+    except Exception:
+        return
+    try:
+        conn = await pool.acquire()
+        # Any constant 64-bit key. Using a stable number makes the lock global.
+        await conn.execute("SELECT pg_advisory_lock(734271234987654321)")
+        _poll_lock_conn = conn
+        logger.info("Polling lock acquired (Postgres advisory lock).")
+    except Exception as exc:
+        logger.warning("Polling lock not acquired (%s)", exc)
+        try:
+            if "conn" in locals() and conn:
+                await pool.release(conn)
+        except Exception:
+            pass
+
+
+async def _release_polling_lock() -> None:
+    global _poll_lock_conn
+    if _poll_lock_conn is None or asyncpg is None:
+        _poll_lock_conn = None
+        return
+    try:
+        pool = await _pg_get_pool()
+        conn = _poll_lock_conn
+        _poll_lock_conn = None
+        try:
+            await conn.execute("SELECT pg_advisory_unlock(734271234987654321)")
+        except Exception:
+            pass
+        try:
+            await pool.release(conn)
+        except Exception:
+            pass
+        logger.info("Polling lock released.")
+    except Exception:
+        _poll_lock_conn = None
 
 
 async def _pg_ensure_schema() -> None:
@@ -4828,6 +4890,12 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("Supabase: not connected (%s)", exc)
 
+    # Prevent Telegram polling conflicts during deploy overlap (best-effort).
+    try:
+        await _acquire_polling_lock()
+    except Exception:
+        pass
+
     # Auto notifications for clan chat (single updating message, no spam)
     try:
         if isinstance(CHAT_ID, int) and CHAT_ID != 0:
@@ -4895,6 +4963,16 @@ async def main() -> None:
                     exc,
                 )
                 raise
+            except TelegramConflictError as exc:
+                if SHUTDOWN_EVENT.is_set():
+                    break
+                # Usually happens when another instance is still polling (e.g. during Render deploy overlap).
+                logger.warning(
+                    "Telegram Conflict (getUpdates already used elsewhere). "
+                    "Жду 60 секунд и пробую снова. (%s)",
+                    exc,
+                )
+                await asyncio.sleep(60)
             except Exception as exc:
                 if SHUTDOWN_EVENT.is_set():
                     break
@@ -4917,6 +4995,10 @@ async def main() -> None:
 
         try:
             await server_runner.cleanup()
+        except Exception:
+            pass
+        try:
+            await _release_polling_lock()
         except Exception:
             pass
         await bot.session.close()
