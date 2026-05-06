@@ -15,7 +15,6 @@ from io import BytesIO
 from urllib.parse import quote
 
 import requests
-import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
@@ -35,6 +34,11 @@ try:
     import clashapi 
 except Exception:  
     clashapi = None
+
+try:
+    import asyncpg
+except Exception:
+    asyncpg = None
 
 TELEGRAM_BOT_TOKEN: str = "8527467590:AAErJnjBo4V9i3mGpzLRqqGDcQ1Q6rwrpU8"
 
@@ -65,7 +69,7 @@ PUBLIC_BASE_URL: str = (
 # WebApp auth/session settings
 WEBAPP_SESSION_TTL_SECONDS: int = 15 * 60
 
-_pg_pool: asyncpg.Pool | None = None
+_pg_pool: object | None = None
 _webapp_sessions: dict[str, dict] = {}
 _links_cache: dict[str, int] = {}  # COC_TAG -> telegram_user_id
 _links_cache_loaded_at: float = 0.0
@@ -821,8 +825,10 @@ def _mention_html(user_id: int, visible_name: str) -> str:
     return f'<a href="tg://user?id={int(user_id)}">{_safe(visible_name)}</a>'
 
 
-async def _pg_get_pool() -> asyncpg.Pool:
+async def _pg_get_pool():
     global _pg_pool
+    if asyncpg is None:
+        raise RuntimeError("asyncpg is not installed")
     if _pg_pool is not None:
         return _pg_pool
     _pg_pool = await asyncpg.create_pool(
