@@ -13,12 +13,34 @@
   <body>
     <main class="app" id="app">
       <header class="header">
-        <div class="badge">Регистрация</div>
+        <div class="topbar">
+          <div class="badge">Регистрация</div>
+          <button class="iconBtn" id="btn-menu" aria-label="Меню">
+            <svg class="iconSvg" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="5" cy="12" r="2.2" />
+              <circle cx="12" cy="12" r="2.2" />
+              <circle cx="19" cy="12" r="2.2" />
+            </svg>
+          </button>
+        </div>
         <h1>Привязка аккаунта</h1>
         <p class="muted">
           Чтобы бот мог отмечать тебя в уведомлениях и не путал игроков.
         </p>
       </header>
+
+      <aside class="drawer hidden" id="drawer">
+        <div class="drawerCard">
+          <div class="drawerTitle">Меню</div>
+          <div class="drawerBody">
+            <button class="drawerBtn" id="drawer-me">Моя привязка</button>
+            <button class="drawerBtn" id="drawer-change">Сменить привязку</button>
+            <button class="drawerBtn danger" id="drawer-unlink">Удалить привязку</button>
+            <button class="drawerBtn" id="drawer-close">Закрыть</button>
+          </div>
+        </div>
+      </aside>
+      <div class="backdrop hidden" id="backdrop"></div>
 
       <section class="card" id="step-intro">
         <h2>Пару минут — и готово</h2>
@@ -87,9 +109,11 @@
       <section class="card hidden" id="step-done">
         <h2>Готово</h2>
         <p class="muted" id="done-text"></p>
+        <div class="playerCard" id="me-card"></div>
         <div class="row">
           <button class="btn primary" id="btn-close">Закрыть</button>
           <button class="btn" id="btn-change">Изменить привязку</button>
+          <button class="btn danger" id="btn-unlink">Удалить привязку</button>
         </div>
       </section>
 
