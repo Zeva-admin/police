@@ -104,6 +104,7 @@ _notify_message_ids: dict[int, int] = {}
 
 # Auto broadcast tasks (war/CWL milestone notifications)
 _broadcast_tasks: dict[int, asyncio.Task] = {}
+_broadcast_sent: dict[str, dict[str, float]] = {}  # war_id -> {milestone -> epoch}
 
 SHUTDOWN_EVENT = asyncio.Event()
 
@@ -736,6 +737,30 @@ def main_menu_keyboard(page: int = 1) -> InlineKeyboardMarkup:
     )
 
 
+def menu_keyboard_for(user_id: int | None, page: int = 1) -> InlineKeyboardMarkup:
+    """
+    Show admin-only buttons only for OWNER_USER_ID.
+    """
+    kb = main_menu_keyboard(page)
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    if uid == int(OWNER_USER_ID):
+        return kb
+    # remove notify button for non-owner
+    filtered: list[list[InlineKeyboardButton]] = []
+    for row in kb.inline_keyboard:
+        new_row = [
+            b
+            for b in row
+            if not (getattr(b, "callback_data", None) == "menu:notify")
+        ]
+        if new_row:
+            filtered.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=filtered)
+
+
 def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")]]
@@ -842,7 +867,9 @@ def _tg_user_display(user: object) -> str:
     try:
         uid = int(getattr(user, "id", 0) or 0)
         first_name = str(getattr(user, "first_name", "") or "пользователь")
-        return _mention_html(uid, first_name)
+        if uid > 0:
+            return _mention_html(uid, first_name)
+        return f"<b>{_safe(first_name)}</b>"
     except Exception:
         return "<b>пользователь</b>"
 
@@ -975,7 +1002,7 @@ async def get_user_link(telegram_user_id: int) -> dict | None:
 
 
 def registration_prompt_text(user) -> str:
-    who = _tg_user_display(user)
+    who = _tg_user_display(user) if user is not None else "<b>Привет</b>"
     return (
         f"{who}, чтобы пользоваться ботом, нужно один раз привязать аккаунт Clash of Clans.\n\n"
         "Это займёт пару минут: тег → подтверждение → токен из игры."
@@ -2629,13 +2656,14 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
     - last hour
     - end result
     """
-    # Polling interval: keeps bot within ~2–3 minutes freshness while being gentle to API.
-    poll_seconds = 150  # 2.5 minutes
+    # Polling interval: keep it calm to avoid spam and rate limits.
+    poll_seconds = 420  # 7 minutes
 
     active_id: str | None = None
     active_kind: str | None = None  # "КВ" | "ЛВК"
     active_war_tag: str | None = None
     sent: set[str] = set()
+    idle_misses = 0
     # CWL full scan (leaguegroup + wars) is expensive. Do it редко.
     cwl_scan_cooldown_seconds = 600  # 10 минут
     cwl_next_scan_at: float = 0.0
@@ -2683,14 +2711,18 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     war = kv
                     war_id = _war_id_kv(kv)
 
-            # No active war/prep
+            # No active war/prep:
+            # Don't immediately reset state (API can flake and cause duplicate milestone posts).
             if not kind or not isinstance(war, dict):
-                active_id = None
-                active_kind = None
-                active_war_tag = None
-                sent.clear()
+                idle_misses += 1
+                if idle_misses >= 6:  # ~40 minutes
+                    active_id = None
+                    active_kind = None
+                    active_war_tag = None
+                    sent.clear()
                 await asyncio.sleep(poll_seconds)
                 continue
+            idle_misses = 0
 
             state = str(war.get("state", "notInWar"))
             if state not in {"preparation", "inWar", "warEnded"}:
@@ -2727,16 +2759,23 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     continue
                 used = len(m.get("attacks", []) or [])
                 if used < attacks_per_member:
-                    name = _safe(m.get("name", "—"))
+                    raw_name = str(m.get("name", "—") or "—")
                     th = m.get("townhallLevel", m.get("townHallLevel", "?"))
-                    missing_lines.append(f"<b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
+                    name_html = _maybe_mention_player(raw_name, m.get("tag"))
+                    missing_lines.append(f"{name_html} (TH{th}) — {used}/{attacks_per_member}")
 
-            # Milestones
+            # Milestones (dedup even if the loop restarts)
+            war_sent = _broadcast_sent.get(active_id or "", {})
+            now_ts = time.time()
+            def _can_send(key: str, cooldown_sec: int = 6 * 3600) -> bool:
+                last = float(war_sent.get(key, 0.0) or 0.0)
+                return (now_ts - last) >= cooldown_sec
+
             if state == "inWar":
                 time_left = _time_left(str(war.get("endTime") or ""))
 
                 # Send at most ONE reminder per loop tick (so it doesn't spam in bursts)
-                if "start" not in sent:
+                if "start" not in sent and _can_send("start", 12 * 3600):
                     text = (
                         f"🔥 <b>{kind} началась!</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2747,7 +2786,8 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     )
                     await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
                     sent.add("start")
-                elif remaining <= 3600 and remaining > 0 and "last_hour" not in sent:
+                    war_sent["start"] = now_ts
+                elif remaining <= 3600 and remaining > 0 and "last_hour" not in sent and _can_send("last_hour", 6 * 3600):
                     text = (
                         f"🚨 <b>{kind}: последний час!</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2756,18 +2796,20 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     )
                     await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
                     sent.add("last_hour")
-                elif elapsed >= int(duration * 0.67) and "twothirds" not in sent and remaining > 3600:
+                    war_sent["last_hour"] = now_ts
+                elif elapsed >= int(duration * 0.67) and "twothirds" not in sent and remaining > 3600 and _can_send("twothirds", 6 * 3600):
                     text = (
-                        f"⚠️ <b>{kind}: уже больше половины</b>\n"
+                        f"⚠️ <b>{kind}: прошло две трети</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n\n"
                         f"До конца: <b>{_safe(time_left)}</b>\n\n"
                         f"{_format_missing_block(missing_lines)}"
                     )
                     await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
                     sent.add("twothirds")
-                elif elapsed >= int(duration * 0.33) and "third" not in sent and remaining > 3600:
+                    war_sent["twothirds"] = now_ts
+                elif elapsed >= int(duration * 0.33) and "third" not in sent and remaining > 3600 and _can_send("third", 6 * 3600):
                     text = (
-                        f"⏱️ <b>{kind}: прошло меньше половины</b>\n"
+                        f"⏱️ <b>{kind}: прошла треть</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n\n"
                         f"До конца: <b>{_safe(time_left)}</b>\n"
                         f"Против: <b>{opp_name}</b>\n\n"
@@ -2775,10 +2817,15 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     )
                     await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
                     sent.add("third")
+                    war_sent["third"] = now_ts
+
+                if active_id:
+                    # store back
+                    _broadcast_sent[active_id] = war_sent
 
             # 5) End result
             if state == "warEnded" or remaining <= 0:
-                if "end" not in sent:
+                if "end" not in sent and _can_send("end", 24 * 3600):
                     # Refresh data for final numbers (especially CWL war)
                     final_war = war
                     if kind == "ЛВК" and active_war_tag:
@@ -2799,6 +2846,9 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     )
                     await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
                     sent.add("end")
+                    if active_id:
+                        war_sent["end"] = now_ts
+                        _broadcast_sent[active_id] = war_sent
 
                 # After sending end, reset to avoid repeated posts
                 active_id = None
@@ -3217,6 +3267,16 @@ async def _ensure_registered_for_message(message: Message) -> bool:
         uid = int(message.from_user.id) if message.from_user else 0
     except Exception:
         uid = 0
+    if uid <= 0:
+        # Message sent without from_user (e.g. anonymous admin / channel). We can't link it.
+        await message.answer(
+            "⚠️ <b>Не вижу, кто отправил команду</b>\n\n"
+            "Скорее всего, сообщение отправлено <b>анонимно</b> (от имени канала/админа).\n"
+            "Отправь команду от своего аккаунта — и я сразу пришлю кнопку регистрации.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return False
     if uid and await is_user_registered(uid):
         return True
     await message.answer(
@@ -3259,7 +3319,7 @@ async def cb_home(query: CallbackQuery) -> None:
     await query.answer()
     if not await _ensure_registered_for_query(query):
         return
-    await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(1))
+    await _edit_or_send(query.message, build_home_text(), menu_keyboard_for(getattr(query.from_user, "id", None), 1))
 
 
 @router_dp.callback_query(F.data == "menu:more")
@@ -3267,7 +3327,7 @@ async def cb_more(query: CallbackQuery) -> None:
     await query.answer()
     if not await _ensure_registered_for_query(query):
         return
-    await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(2))
+    await _edit_or_send(query.message, build_home_text(), menu_keyboard_for(getattr(query.from_user, "id", None), 2))
 
 
 @router_dp.callback_query(F.data == "menu:back")
@@ -3275,7 +3335,7 @@ async def cb_back(query: CallbackQuery) -> None:
     await query.answer()
     if not await _ensure_registered_for_query(query):
         return
-    await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(1))
+    await _edit_or_send(query.message, build_home_text(), menu_keyboard_for(getattr(query.from_user, "id", None), 1))
 
 
 @router_dp.callback_query(F.data == "menu:webapp")
@@ -3623,6 +3683,13 @@ async def cb_player_stats_refresh(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:notify")
 async def cb_notify(query: CallbackQuery) -> None:
     await query.answer()
+    if not (query.from_user and int(query.from_user.id) == int(OWNER_USER_ID)):
+        await _edit_or_send(
+            query.message,
+            "⛔ <b>Нет доступа</b>\n\nЭта кнопка доступна только администратору.",
+            menu_keyboard_for(getattr(query.from_user, "id", None), 1),
+        )
+        return
     if not await _ensure_registered_for_query(query):
         return
 
@@ -3636,7 +3703,7 @@ async def cb_notify(query: CallbackQuery) -> None:
             "🔕 <b>Уведомления выключены</b>\n\n"
             "Оповещения остановлены."
         )
-        await _edit_or_send(query.message, text, main_menu_keyboard())
+        await _edit_or_send(query.message, text, menu_keyboard_for(getattr(query.from_user, "id", None), 1))
         return
 
     bot = query.bot
@@ -3915,15 +3982,17 @@ async def cb_cwl_round(query: CallbackQuery) -> None:
 @router_dp.message(Command("start"))
 async def handle_start(message: Message) -> None:
     """Главное меню бота."""
+    logger.info("User %s triggered /start in chat %s", getattr(message.from_user, "id", "—"), message.chat.id)
     if not await _ensure_registered_for_message(message):
         return
-    await message.answer(build_home_text(), parse_mode="HTML", reply_markup=main_menu_keyboard(1))
-    logger.info("User %s triggered /start", message.from_user.id)
+    await message.answer(build_home_text(), parse_mode="HTML", reply_markup=menu_keyboard_for(getattr(message.from_user, "id", None), 1))
+    logger.info("User %s triggered /start", getattr(message.from_user, "id", "—"))
 
 
 @router_dp.message(Command("reg"))
 async def handle_reg(message: Message) -> None:
     """Показать кнопку регистрации (Mini App)."""
+    logger.info("User %s triggered /reg in chat %s", getattr(message.from_user, "id", "—"), message.chat.id)
     try:
         uid = int(message.from_user.id) if message.from_user else 0
     except Exception:
@@ -4166,13 +4235,13 @@ async def handle_help(message: Message) -> None:
         "Теги можно писать с <code>#</code> или без него."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=back_to_menu_keyboard())
-    logger.info("User %s triggered /help", message.from_user.id)
+    logger.info("User %s triggered /help", getattr(message.from_user, "id", "—"))
 
 
 @router_dp.message(Command("clan"))
 async def handle_clan(message: Message) -> None:
     """Показать информацию о клане (по умолчанию — CLAN_TAG)."""
-    logger.info("User %s triggered /clan", message.from_user.id)
+    logger.info("User %s triggered /clan", getattr(message.from_user, "id", "—"))
     if not await _ensure_registered_for_message(message):
         return
 
@@ -4201,7 +4270,7 @@ async def handle_player(message: Message) -> None:
     Показать информацию об игроке по тегу.
     Пример: /player #2PP
     """
-    logger.info("User %s triggered /player", message.from_user.id)
+    logger.info("User %s triggered /player", getattr(message.from_user, "id", "—"))
     if not await _ensure_registered_for_message(message):
         return
 
@@ -4241,7 +4310,7 @@ async def handle_player(message: Message) -> None:
 @router_dp.message(Command("war"))
 async def handle_war(message: Message) -> None:
     """Показать текущую войну клана (CLAN_TAG)."""
-    logger.info("User %s triggered /war", message.from_user.id)
+    logger.info("User %s triggered /war", getattr(message.from_user, "id", "—"))
     if not await _ensure_registered_for_message(message):
         return
 
@@ -4257,7 +4326,7 @@ async def handle_war(message: Message) -> None:
 @router_dp.message(Command("members"))
 async def handle_members(message: Message) -> None:
     """Показать участников клана (страница 1)."""
-    logger.info("User %s triggered /members", message.from_user.id)
+    logger.info("User %s triggered /members", getattr(message.from_user, "id", "—"))
     if not await _ensure_registered_for_message(message):
         return
 
@@ -4275,7 +4344,7 @@ async def handle_members(message: Message) -> None:
 @router_dp.message(Command("top"))
 async def handle_top(message: Message) -> None:
     """Топ 10 участников клана по трофеям."""
-    logger.info("User %s triggered /top", message.from_user.id)
+    logger.info("User %s triggered /top", getattr(message.from_user, "id", "—"))
     if not await _ensure_registered_for_message(message):
         return
 
@@ -4329,7 +4398,7 @@ async def handle_top(message: Message) -> None:
 @router_dp.message(Command("donations"))
 async def handle_donations(message: Message) -> None:
     """Топ донатеров клана за сезон."""
-    logger.info("User %s triggered /donations", message.from_user.id)
+    logger.info("User %s triggered /donations", getattr(message.from_user, "id", "—"))
     if not await _ensure_registered_for_message(message):
         return
 
