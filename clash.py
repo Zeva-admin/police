@@ -40,7 +40,7 @@ try:
 except Exception:
     asyncpg = None
 
-TELEGRAM_BOT_TOKEN: str = "8527467590:AAErJnjBo4V9i3mGpzLRqqGDcQ1Q6rwrpU8"
+TELEGRAM_BOT_TOKEN: str = "8475734533:AAGNmWjhpWfYCF-4lnJyERqnBJbOiMmp480"
 
 # Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
