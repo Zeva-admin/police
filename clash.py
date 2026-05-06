@@ -40,7 +40,7 @@ try:
 except Exception:
     asyncpg = None
 
-TELEGRAM_BOT_TOKEN: str = "8475734533:AAGNmWjhpWfYCF-4lnJyERqnBJbOiMmp480"
+TELEGRAM_BOT_TOKEN: str = "8527467590:AAErJnjBo4V9i3mGpzLRqqGDcQ1Q6rwrpU8"
 
 # Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
@@ -2144,11 +2144,12 @@ def build_war_text(data: dict, *, mode: str = "war", include_title: bool = True)
     for m in our_members:
         if not isinstance(m, dict):
             continue
-        name = _safe(m.get("name", "—"))
+        raw_name = str(m.get("name", "—") or "—")
         th = m.get("townhallLevel", "?")
         used = len(m.get("attacks", []) or [])
         if used < attacks_per_member:
-            missing.append(f"<b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
+            name_html = _maybe_mention_player(raw_name, m.get("tag"))
+            missing.append(f"{name_html} (TH{th}) — {used}/{attacks_per_member}")
 
     opp_missing_count = 0
     for m in opp_members:
@@ -2165,22 +2166,32 @@ def build_war_text(data: dict, *, mode: str = "war", include_title: bool = True)
                 attacks_flat.append(a)
     attacks_flat.sort(key=lambda a: a.get("order", 10**9))
 
+    # Render attack list:
+    # - for small wars (<=20) show all attacks
+    # - for large wars show the latest 25 (keeps message within Telegram limits)
+    attack_limit = 25
+    if str(team_size).isdigit() and int(team_size) <= 20:
+        attack_limit = 200  # effectively "all"
+    attacks_slice = attacks_flat[-attack_limit:]
+
     last_attacks_lines: list[str] = []
-    for a in attacks_flat[-8:]:
+    for a in attacks_slice:
         attacker = our_by_tag.get(a.get("attackerTag")) or {}
         defender = opp_by_tag.get(a.get("defenderTag")) or {}
-        attacker_name = _safe(attacker.get("name", a.get("attackerTag", "—")))
+        attacker_raw = str(attacker.get("name") or a.get("attackerTag") or "—")
+        attacker_name = _maybe_mention_player(attacker_raw, attacker.get("tag"))
         defender_name = _safe(defender.get("name", a.get("defenderTag", "—")))
         dpos = defender.get("mapPosition", "?")
         stars = int(a.get("stars", 0) or 0)
         destr = int(a.get("destructionPercentage", 0) or 0)
         stars_str = "⭐" * stars + "☆" * (3 - stars)
         last_attacks_lines.append(
-            f"<b>{attacker_name}</b> → #{dpos} <b>{defender_name}</b> — {stars_str} — <b>{destr}%</b>"
+            f"{attacker_name} → #{dpos} <b>{defender_name}</b> — {stars_str} — <b>{destr}%</b>"
         )
 
     if missing:
-        missing_block = "\n\n❌ <b>Кому ещё нужно атаковать:</b>\n" + "\n".join(
+        label = "❌ <b>Кто не атаковал:</b>" if state == "warEnded" else "❌ <b>Кому ещё нужно атаковать:</b>"
+        missing_block = "\n\n" + label + "\n" + "\n".join(
             f"{i}. {line}" for i, line in enumerate(missing, start=1)
         )
     else:
@@ -2198,12 +2209,16 @@ def build_war_text(data: dict, *, mode: str = "war", include_title: bool = True)
             f" • Соперник <b>{opp_attacks}/{total_attacks}</b> (осталось {opp_left})"
         )
 
+    time_block = f"⏳ Осталось: <b>{_safe(left)}</b>\n\n"
+    if state == "warEnded":
+        time_block = "\n\n"
+
     body = (
         f"Тег клана: <code>{_safe(CLAN_TAG)}</code>\n"
         f"Статус: <b>{_safe(_normalize_state_label(state))}</b>\n"
         f"Формат: <b>{team_size}×{team_size}</b> • атак на участника: <b>{attacks_per_member}</b>\n"
         f"🏁 Конец: <b>{_safe(end)}</b>\n"
-        f"⏳ Осталось: <b>{_safe(left)}</b>\n\n"
+        f"{time_block}"
         f"🏰 <b>{our_name}</b>: ⭐ <b>{our_stars}</b> • 💥 <b>{our_destr:.2f}%</b>\n"
         f"🟥 <b>{opp_name}</b>: ⭐ <b>{opp_stars}</b> • 💥 <b>{opp_destr:.2f}%</b>"
         f"{left_line}"
@@ -3107,6 +3122,59 @@ async def http_api_me(request: web.Request) -> web.Response:
         return _json_error(f"Не удалось загрузить данные ({exc})", 502)
 
 
+async def http_api_unlink(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    init_data = str((payload or {}).get("initData") or "")
+    user = _validate_webapp_init_data(init_data)
+    if not user:
+        return _json_error("Открой это окно через кнопку в боте и попробуй ещё раз.", 403)
+    uid = int(user.get("id") or 0)
+    if not uid:
+        return _json_error("Не удалось определить профиль.", 400)
+    if asyncpg is None:
+        return _json_error("Сервис временно недоступен.", 503)
+
+    try:
+        pool = await _pg_get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT coc_tag, coc_name FROM coc_links WHERE telegram_user_id=$1", uid)
+            await conn.execute("DELETE FROM coc_links WHERE telegram_user_id=$1", uid)
+        # update caches
+        try:
+            _tg_links_cache.pop(uid, None)
+        except Exception:
+            pass
+        if row:
+            try:
+                _links_cache.pop(_norm_tag(row["coc_tag"]), None)
+            except Exception:
+                pass
+
+        # Notify clan chat
+        try:
+            if _BOT_INSTANCE and isinstance(CHAT_ID, int) and CHAT_ID != 0:
+                mention = _mention_html(uid, str(user.get("first_name") or "игрок"))
+                coc = _safe(str((row or {}).get("coc_name") or "Игрок"))
+                tag = _safe(str((row or {}).get("coc_tag") or ""))
+                await _BOT_INSTANCE.send_message(
+                    CHAT_ID,
+                    f"ℹ️ {mention} убрал привязку аккаунта: <b>{coc}</b> <code>{tag}</code>",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+        except Exception:
+            pass
+
+        return web.json_response({"ok": True})
+    except Exception as exc:
+        logger.error("Unlink failed: %s", exc)
+        return _json_error("Не удалось удалить привязку. Попробуй ещё раз.", 502)
+
+
 async def start_render_server() -> web.AppRunner:
     """
     Render web services expect the process to bind to $PORT.
@@ -3125,6 +3193,7 @@ async def start_render_server() -> web.AppRunner:
     app.router.add_post("/api/lookup", http_api_lookup)
     app.router.add_post("/api/verify", http_api_verify)
     app.router.add_post("/api/me", http_api_me)
+    app.router.add_post("/api/unlink", http_api_unlink)
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
