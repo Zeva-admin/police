@@ -17,7 +17,7 @@ from urllib.parse import quote
 import requests
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramUnauthorizedError
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -41,7 +41,11 @@ try:
 except Exception:
     asyncpg = None
 
-TELEGRAM_BOT_TOKEN: str = "8624486117:AAEIBVkKi7s8rZz79EPV7U5i7HL9DJRlFYE"
+_TELEGRAM_BOT_TOKEN_ENV = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_BOT_TOKEN: str = (
+    _TELEGRAM_BOT_TOKEN_ENV
+    or "8624486117:AAEIBVkKi7s8rZz79EPV7U5i7HL9DJRlFYE"
+).strip()
 
 # Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
@@ -111,9 +115,9 @@ _clash_token_source: str = "unset"  # "clashapi" | "unset"
 _notify_tasks: dict[int, asyncio.Task] = {}
 _notify_message_ids: dict[int, int] = {}
 
-# Auto broadcast tasks (war/CWL milestone notifications)
-_broadcast_tasks: dict[int, asyncio.Task] = {}
-_broadcast_sent: dict[str, dict[str, float]] = {}  # war_id -> {milestone -> epoch}
+# Notification tasks
+_broadcast_tasks: dict[int, asyncio.Task] = {}  # legacy name: used for notify loop tasks
+_broadcast_sent: dict[str, dict[str, float]] = {}  # kept for backward compatibility (no longer used heavily)
 
 SHUTDOWN_EVENT = asyncio.Event()
 
@@ -2402,7 +2406,7 @@ def build_leaders_text(members: list[dict]) -> str:
     leaders.sort(key=lambda m: (role_order.get(m.get("role", ""), 9), -m.get("trophies", 0)))
 
     lines: list[str] = []
-    for m in leaders:
+    for idx, m in enumerate(leaders, start=1):
         name = _safe(m.get("name", "—"))
         tag = _safe(m.get("tag", ""))
         th = m.get("townHallLevel", "?")
@@ -2412,7 +2416,7 @@ def build_leaders_text(members: list[dict]) -> str:
         role_emoji = get_role_emoji(role)
         role_label = get_role_label(role)
         lines.append(
-            f"{role_emoji} <b>{role_label}:</b> <b>{name}</b> <code>{tag}</code>\n"
+            f"{idx}. {role_emoji} <b>{role_label}:</b> <b>{name}</b> <code>{tag}</code>\n"
             f"    🏰 TH{th} • ⚡ {ranked_league} • 🏅 {trophy_league}"
         )
 
@@ -2435,7 +2439,7 @@ def build_warlog_text(data: dict) -> str:
         )
 
     lines: list[str] = []
-    for it in items[:5]:
+    for idx, it in enumerate(items[:5], start=1):
         if not isinstance(it, dict):
             continue
         result = str(it.get("result", "—"))
@@ -2453,7 +2457,7 @@ def build_warlog_text(data: dict) -> str:
         o_d = float(opp.get("destructionPercentage", 0.0) or 0.0)
 
         lines.append(
-            f"• <b>{result_ru}</b> vs <b>{opp_name}</b> ({team_size}×{team_size})\n"
+            f"{idx}. <b>{result_ru}</b> vs <b>{opp_name}</b> ({team_size}×{team_size})\n"
             f"  ⭐ <b>{c_stars}</b>:<b>{o_stars}</b> • 💥 <b>{c_d:.2f}%</b>:<b>{o_d:.2f}%</b>\n"
             f"  🕒 {_safe(end_time)}"
         )
@@ -2694,12 +2698,6 @@ def get_current_cwl_war_for_clan() -> tuple[str | None, dict | None]:
             if ctag == our_tag or otag == our_tag:
                 return wt, war
 
-    # fallback: just return any war involving us
-    for r in rounds:
-        war_tag, war = find_our_war_in_round(r, _norm_tag(CLAN_TAG))
-        if war_tag and isinstance(war, dict):
-            return war_tag, war
-
     return None, None
 
 
@@ -2938,8 +2936,9 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     sent.add("start")
                     war_sent["start"] = now_ts
                 elif remaining <= 3600 and remaining > 0 and "last_hour" not in sent and _can_send("last_hour", 6 * 3600):
+                    urgent_label = "финальные минуты" if remaining <= 600 else "последний час"
                     text = (
-                        f"🚨 <b>{kind}: последний час!</b>\n"
+                        f"🚨 <b>{kind}: {urgent_label}!</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n\n"
                         f"Осталось: <b>{_safe(time_left)}</b>\n\n"
                         f"{_format_missing_block(missing_lines)}"
@@ -3873,9 +3872,9 @@ async def cb_notify(query: CallbackQuery) -> None:
     source_chat = query.message.chat
     target_chat_id = int(CHAT_ID) if isinstance(CHAT_ID, int) and CHAT_ID != 0 else source_chat.id
 
-    if target_chat_id in _broadcast_tasks and not _broadcast_tasks[target_chat_id].done():
-        _broadcast_tasks[target_chat_id].cancel()
-        _broadcast_tasks.pop(target_chat_id, None)
+    if target_chat_id in _notify_tasks and not _notify_tasks[target_chat_id].done():
+        _notify_tasks[target_chat_id].cancel()
+        _notify_tasks.pop(target_chat_id, None)
         text = (
             "🔕 <b>Уведомления выключены</b>\n\n"
             "Оповещения остановлены."
@@ -3884,8 +3883,8 @@ async def cb_notify(query: CallbackQuery) -> None:
         return
 
     bot = query.bot
-    task = asyncio.create_task(_broadcast_milestones_loop(bot, target_chat_id))
-    _broadcast_tasks[target_chat_id] = task
+    task = asyncio.create_task(_notify_loop(bot, target_chat_id))
+    _notify_tasks[target_chat_id] = task
 
     if getattr(source_chat, "type", "") not in {"group", "supergroup"} and target_chat_id == source_chat.id:
         text = (
@@ -3896,22 +3895,34 @@ async def cb_notify(query: CallbackQuery) -> None:
         )
         await _edit_or_send(query.message, text, main_menu_keyboard())
         # stop task started for private chat
-        _broadcast_tasks[target_chat_id].cancel()
-        _broadcast_tasks.pop(target_chat_id, None)
+        _notify_tasks[target_chat_id].cancel()
+        _notify_tasks.pop(target_chat_id, None)
         return
 
-    # Quick permission check: try sending a short message once
+    # Quick permission check: try sending a short message once, then delete it to avoid clutter
     try:
-        await bot.send_message(
+        test_tid = None
+        try:
+            if int(target_chat_id) == int(CHAT_ID) and int(CHAT_MAIN_THREAD_ID or 0) > 0:
+                test_tid = int(CHAT_MAIN_THREAD_ID)
+        except Exception:
+            test_tid = None
+        test_msg = await bot.send_message(
             target_chat_id,
-            "🔔 <b>Уведомления включены</b>\n\nБуду писать по ключевым моментам КВ/ЛВК.",
+            "🔔 Уведомления включены",
             parse_mode="HTML",
             disable_web_page_preview=True,
+            disable_notification=True,
+            message_thread_id=test_tid,
         )
+        try:
+            await bot.delete_message(target_chat_id, test_msg.message_id)
+        except Exception:
+            pass
     except (TelegramForbiddenError, TelegramBadRequest) as exc:
         logger.warning("Cannot post broadcast to chat %s: %s", target_chat_id, exc)
-        _broadcast_tasks[target_chat_id].cancel()
-        _broadcast_tasks.pop(target_chat_id, None)
+        _notify_tasks[target_chat_id].cancel()
+        _notify_tasks.pop(target_chat_id, None)
         await _edit_or_send(
             query.message,
             "⚠️ <b>Не получилось включить уведомления</b>\n"
@@ -3924,12 +3935,6 @@ async def cb_notify(query: CallbackQuery) -> None:
         )
         return
 
-    await _edit_or_send(
-        query.message,
-        "🔔 <b>Уведомления включены</b>\n\n"
-        "Сообщения будут приходить отдельными постами — чтобы их точно заметили.",
-        main_menu_keyboard(),
-    )
     text = (
         "🔔 <b>Уведомления включены</b>\n\n"
         "Теперь я буду писать напоминания в клановый чат (одним обновляемым сообщением).\n\n"
@@ -4760,6 +4765,8 @@ async def main() -> None:
         pass
 
     # Initialize bot instance early (used by WebApp verification handler for announcements)
+    token_prefix = (TELEGRAM_BOT_TOKEN.split(":", 1)[0] if TELEGRAM_BOT_TOKEN else "—")
+    logger.info("Telegram token prefix (bot id): %s", token_prefix)
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     global _BOT_INSTANCE
     _BOT_INSTANCE = bot
@@ -4767,6 +4774,17 @@ async def main() -> None:
     try:
         me = await bot.get_me()
         _BOT_USERNAME = str(getattr(me, "username", "") or "").strip()
+        try:
+            actual_id = str(getattr(me, "id", "") or "")
+            if token_prefix and token_prefix != "—" and actual_id and token_prefix != actual_id:
+                logger.warning(
+                    "Telegram token prefix does not match getMe() id (%s != %s). "
+                    "Check Render env TELEGRAM_BOT_TOKEN / hardcoded token.",
+                    token_prefix,
+                    actual_id,
+                )
+        except Exception:
+            pass
     except Exception:
         _BOT_USERNAME = ""
     dp = router_dp
@@ -4794,22 +4812,20 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("Supabase: not connected (%s)", exc)
 
-    # Auto notifications for clan chat (new messages, milestone-based)
+    # Auto notifications for clan chat (single updating message, no spam)
     try:
         if isinstance(CHAT_ID, int) and CHAT_ID != 0:
-            if CHAT_ID not in _broadcast_tasks or _broadcast_tasks[CHAT_ID].done():
+            if CHAT_ID not in _notify_tasks or _notify_tasks[CHAT_ID].done():
                 # Verify that bot can access the chat (avoid noisy "chat not found" loops)
                 try:
                     await bot.get_chat(CHAT_ID)
                     # Prime a group menu message so the bot is usable in groups even with Privacy Mode on.
                     # (Users can always interact via inline callbacks from this message.)
                     await _prime_group_menu(bot)
-                    _broadcast_tasks[CHAT_ID] = asyncio.create_task(
-                        _broadcast_milestones_loop(bot, CHAT_ID)
-                    )
-                    logger.info("Auto broadcast notifications enabled for chat %s", CHAT_ID)
+                    _notify_tasks[CHAT_ID] = asyncio.create_task(_notify_loop(bot, CHAT_ID))
+                    logger.info("Auto notifications enabled for chat %s", CHAT_ID)
                 except Exception as exc:
-                    logger.warning("Auto broadcast disabled: cannot access chat %s (%s)", CHAT_ID, exc)
+                    logger.warning("Auto notifications disabled: cannot access chat %s (%s)", CHAT_ID, exc)
     except Exception:
         pass
 
@@ -4826,6 +4842,16 @@ async def main() -> None:
         except Exception:
             # Signal handlers may be unsupported on Windows
             pass
+
+        # Ensure token is valid early (otherwise polling will loop forever with Unauthorized)
+        try:
+            await bot.get_me()
+        except TelegramUnauthorizedError as exc:
+            logger.critical(
+                "Telegram Unauthorized: токен бота неверный или был сброшен в BotFather. (%s)",
+                exc,
+            )
+            sys.exit(1)
 
         # Ensure no webhook is set (polling only)
         try:
@@ -4846,6 +4872,13 @@ async def main() -> None:
                 if not SHUTDOWN_EVENT.is_set():
                     logger.warning("Polling завершился. Перезапуск через 3 секунды...")
                     await asyncio.sleep(3)
+            except TelegramUnauthorizedError as exc:
+                logger.critical(
+                    "Telegram Unauthorized: токен бота неверный или был сброшен в BotFather. "
+                    "Обнови токен и перезапусти сервис. (%s)",
+                    exc,
+                )
+                raise
             except Exception as exc:
                 if SHUTDOWN_EVENT.is_set():
                     break
