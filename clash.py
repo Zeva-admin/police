@@ -59,10 +59,14 @@ CHAT_ID: int = -1002552886756
 # Supabase (Postgres) connection string (same settings as bot.py; hardcoded as requested)
 DATABASE_URL: str = "postgresql://postgres.jqiomtvtvtsizubzunhb:My%20happy%20life64@aws-1-eu-north-1.pooler.supabase.com:5432/postgres"
 
-# Public base URL for Telegram Mini App (Render usually sets RENDER_EXTERNAL_URL automatically)
+# Public base URL for Telegram Mini App (must be HTTPS for Telegram Web Apps)
+_RENDER_EXTERNAL_URL = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
+_RENDER_EXTERNAL_HOSTNAME = (os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "").strip()
+_PUBLIC_BASE_URL_ENV = (os.environ.get("PUBLIC_BASE_URL") or "").strip()
 PUBLIC_BASE_URL: str = (
-    (os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
-    or (os.environ.get("PUBLIC_BASE_URL") or "").strip()
+    _RENDER_EXTERNAL_URL
+    or (f"https://{_RENDER_EXTERNAL_HOSTNAME}" if _RENDER_EXTERNAL_HOSTNAME else "")
+    or _PUBLIC_BASE_URL_ENV
     or "http://localhost:10000"
 )
 
@@ -940,9 +944,20 @@ def _validate_webapp_init_data(init_data: str) -> dict | None:
         v = (data.get(k) or [""])[0]
         pairs.append(f"{k}={v}")
     data_check_string = "\n".join(pairs)
-    secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode("utf-8")).digest()
-    calc_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calc_hash, recv_hash):
+    # Telegram WebApp initData signature:
+    # secret_key = HMAC_SHA256("WebAppData", bot_token)
+    # hash = HMAC_SHA256(data_check_string, secret_key)
+    secret_key = hmac.new(
+        b"WebAppData",
+        TELEGRAM_BOT_TOKEN.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    calc_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(calc_hash, str(recv_hash).strip().lower()):
         return None
     try:
         auth_date = int((data.get("auth_date") or ["0"])[0])
