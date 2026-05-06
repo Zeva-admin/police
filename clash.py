@@ -820,6 +820,53 @@ async def _clear_legacy_reply_keyboard(message: Message) -> None:
         pass
 
 
+def _group_startup_menu_text(bot_username: str | None) -> str:
+    uname = (bot_username or "").strip()
+    suffix = f"@{uname}" if uname and not uname.startswith("@") else (uname if uname else "")
+    start_hint = f"<code>/start{suffix}</code>" if suffix else "<code>/start</code>"
+    return (
+        "📌 <b>Меню бота</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Открывай меню кнопками ниже.\n"
+        f"Если нужно вызвать командой — {start_hint}."
+    )
+
+
+async def _prime_group_menu(bot: Bot) -> None:
+    """
+    Helps group usage when Privacy Mode is enabled:
+    Telegram may deliver general commands only when this bot was the last bot to send a message.
+    We post a single menu message with inline buttons to CHAT_ID so users can interact via callbacks.
+    """
+    try:
+        if not isinstance(CHAT_ID, int) or int(CHAT_ID) == 0:
+            return
+        tid: int | None = None
+        try:
+            if int(CHAT_MAIN_THREAD_ID or 0) > 0:
+                tid = int(CHAT_MAIN_THREAD_ID)
+        except Exception:
+            tid = None
+
+        try:
+            me = await bot.get_me()
+            uname = getattr(me, "username", None)
+        except Exception:
+            uname = None
+
+        await bot.send_message(
+            CHAT_ID,
+            _group_startup_menu_text(uname),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            disable_notification=True,
+            reply_markup=menu_keyboard_for(None, 1),
+            message_thread_id=tid,
+        )
+    except Exception as exc:
+        logger.warning("Group menu prime skipped (%s)", exc)
+
+
 def members_pager_keyboard(page: int, total_pages: int, chunk: list[dict]) -> InlineKeyboardMarkup:
     nav_row: list[InlineKeyboardButton] = []
     if page > 1:
@@ -4693,6 +4740,9 @@ async def main() -> None:
                 # Verify that bot can access the chat (avoid noisy "chat not found" loops)
                 try:
                     await bot.get_chat(CHAT_ID)
+                    # Prime a group menu message so the bot is usable in groups even with Privacy Mode on.
+                    # (Users can always interact via inline callbacks from this message.)
+                    await _prime_group_menu(bot)
                     _broadcast_tasks[CHAT_ID] = asyncio.create_task(
                         _broadcast_milestones_loop(bot, CHAT_ID)
                     )
