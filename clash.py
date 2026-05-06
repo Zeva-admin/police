@@ -41,7 +41,7 @@ try:
 except Exception:
     asyncpg = None
 
-TELEGRAM_BOT_TOKEN: str = "8624486117:AAGH-imAuZypyJmGsN_dvkLJVA4AXoKoaNc"
+TELEGRAM_BOT_TOKEN: str = "8475734533:AAGNmWjhpWfYCF-4lnJyERqnBJbOiMmp480"
 
 # Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
@@ -91,6 +91,7 @@ _tg_links_cache_loaded_at: float = 0.0
 
 # Bot instance for WebApp handlers (set in main)
 _BOT_INSTANCE: Bot | None = None
+_BOT_USERNAME: str = ""
 
 # Local time formatting for UI (UTC offset). Ashgabat is UTC+5.
 LOCAL_UTC_OFFSET_HOURS: int = 5
@@ -690,8 +691,24 @@ def extract_tag_arg(text: str, default_tag: str | None = None) -> str | None:
     return tag
 
 
-def main_menu_keyboard(page: int = 1) -> InlineKeyboardMarkup:
+def _registration_menu_button(chat_type: str) -> InlineKeyboardButton:
+    """
+    WebApp buttons are allowed only in private chats. In groups we must use a URL button.
+    """
+    ct = (chat_type or "").lower()
     wa_url = miniapp_https_url()
+    if ct == "private" and wa_url:
+        return InlineKeyboardButton(text="✅ Зарегистрироваться", web_app=WebAppInfo(url=wa_url))
+    if ct == "private" and not wa_url:
+        return InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")
+
+    uname = (_BOT_USERNAME or "").strip().lstrip("@")
+    if uname:
+        return InlineKeyboardButton(text="✅ Зарегистрироваться", url=f"https://t.me/{uname}?start=reg")
+    return InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")
+
+
+def main_menu_keyboard(page: int = 1, chat_type: str = "supergroup") -> InlineKeyboardMarkup:
     if page == 2:
         return InlineKeyboardMarkup(
             inline_keyboard=[
@@ -699,13 +716,7 @@ def main_menu_keyboard(page: int = 1) -> InlineKeyboardMarkup:
                     InlineKeyboardButton(text="🔎 Поиск", callback_data="menu:find"),
                     InlineKeyboardButton(text="🔗 Ссылка клана", callback_data="menu:link"),
                 ],
-                [
-                    (
-                        InlineKeyboardButton(text="✅ Зарегистрироваться", web_app=WebAppInfo(url=wa_url))
-                        if wa_url
-                        else InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")
-                    )
-                ],
+                [_registration_menu_button(chat_type)],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:back")],
             ]
         )
@@ -733,23 +744,17 @@ def main_menu_keyboard(page: int = 1) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🏚️ Столица", callback_data="menu:capital"),
             ],
             [InlineKeyboardButton(text="📊 Статистика игрока", callback_data="menu:pstats")],
-            [
-                (
-                    InlineKeyboardButton(text="✅ Зарегистрироваться", web_app=WebAppInfo(url=wa_url))
-                    if wa_url
-                    else InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")
-                )
-            ],
+            [_registration_menu_button(chat_type)],
             [InlineKeyboardButton(text="➕ Ещё", callback_data="menu:more")],
         ]
     )
 
 
-def menu_keyboard_for(user_id: int | None, page: int = 1) -> InlineKeyboardMarkup:
+def menu_keyboard_for(user_id: int | None, page: int = 1, chat_type: str = "supergroup") -> InlineKeyboardMarkup:
     """
     Show admin-only buttons only for OWNER_USER_ID.
     """
-    kb = main_menu_keyboard(page)
+    kb = main_menu_keyboard(page, chat_type=chat_type)
     try:
         uid = int(user_id or 0)
     except Exception:
@@ -860,7 +865,7 @@ async def _prime_group_menu(bot: Bot) -> None:
             parse_mode="HTML",
             disable_web_page_preview=True,
             disable_notification=True,
-            reply_markup=menu_keyboard_for(None, 1),
+            reply_markup=menu_keyboard_for(None, 1, chat_type="supergroup"),
             message_thread_id=tid,
         )
     except Exception as exc:
@@ -1111,13 +1116,39 @@ def registration_prompt_text(user) -> str:
 
 
 def registration_keyboard() -> InlineKeyboardMarkup:
+    return registration_keyboard_for(chat_type="private")
+
+
+def registration_keyboard_for(chat_type: str, bot_username: str | None = None) -> InlineKeyboardMarkup:
+    """
+    Telegram forbids WebApp buttons in non-private chats (BUTTON_TYPE_INVALID).
+    - In private chats: use web_app button.
+    - In groups/supergroups: show a URL button that opens a private chat with the bot.
+    """
     wa_url = miniapp_https_url()
-    if wa_url:
+    if (chat_type or "").lower() == "private":
+        if wa_url:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Зарегистрироваться", web_app=WebAppInfo(url=wa_url))],
+                ]
+            )
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Зарегистрироваться", web_app=WebAppInfo(url=wa_url))],
+                [InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")],
             ]
         )
+
+    # Group mode: open private chat via deep link
+    uname = (bot_username or _BOT_USERNAME or "").strip().lstrip("@")
+    if uname:
+        url = f"https://t.me/{uname}?start=reg"
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Зарегистрироваться", url=url)],
+            ]
+        )
+    # Fallback: show instructions (still no web_app button)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")],
@@ -3416,7 +3447,7 @@ async def _ensure_registered_for_message(message: Message) -> bool:
     await _answer_in_thread(
         registration_prompt_text(message.from_user),
         parse_mode="HTML",
-        reply_markup=registration_keyboard(),
+        reply_markup=registration_keyboard_for(getattr(message.chat, "type", "supergroup")),
         disable_web_page_preview=True,
     )
     return False
@@ -3438,7 +3469,7 @@ async def _ensure_registered_for_query(query: CallbackQuery) -> bool:
     await _edit_or_send(
         query.message,
         registration_prompt_text(query.from_user),
-        registration_keyboard(),
+        registration_keyboard_for(getattr(query.message.chat, "type", "supergroup")),
     )
     return False
 
@@ -3453,7 +3484,11 @@ async def cb_home(query: CallbackQuery) -> None:
     await query.answer()
     if not await _ensure_registered_for_query(query):
         return
-    await _edit_or_send(query.message, build_home_text(), menu_keyboard_for(getattr(query.from_user, "id", None), 1))
+    await _edit_or_send(
+        query.message,
+        build_home_text(),
+        menu_keyboard_for(getattr(query.from_user, "id", None), 1, chat_type=getattr(query.message.chat, "type", "supergroup")),
+    )
 
 
 @router_dp.callback_query(F.data == "menu:more")
@@ -3461,7 +3496,11 @@ async def cb_more(query: CallbackQuery) -> None:
     await query.answer()
     if not await _ensure_registered_for_query(query):
         return
-    await _edit_or_send(query.message, build_home_text(), menu_keyboard_for(getattr(query.from_user, "id", None), 2))
+    await _edit_or_send(
+        query.message,
+        build_home_text(),
+        menu_keyboard_for(getattr(query.from_user, "id", None), 2, chat_type=getattr(query.message.chat, "type", "supergroup")),
+    )
 
 
 @router_dp.callback_query(F.data == "menu:back")
@@ -3469,7 +3508,11 @@ async def cb_back(query: CallbackQuery) -> None:
     await query.answer()
     if not await _ensure_registered_for_query(query):
         return
-    await _edit_or_send(query.message, build_home_text(), menu_keyboard_for(getattr(query.from_user, "id", None), 1))
+    await _edit_or_send(
+        query.message,
+        build_home_text(),
+        menu_keyboard_for(getattr(query.from_user, "id", None), 1, chat_type=getattr(query.message.chat, "type", "supergroup")),
+    )
 
 
 @router_dp.callback_query(F.data == "menu:webapp")
@@ -4118,13 +4161,20 @@ async def handle_start(message: Message) -> None:
     """Главное меню бота."""
     logger.info("User %s triggered /start in chat %s", getattr(message.from_user, "id", "—"), message.chat.id)
     await _clear_legacy_reply_keyboard(message)
+    try:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) > 1 and parts[1].strip().lower() == "reg":
+            await handle_reg(message)
+            return
+    except Exception:
+        pass
     if not await _ensure_registered_for_message(message):
         return
     await _answer_in_thread(
         message,
         build_home_text(),
         parse_mode="HTML",
-        reply_markup=menu_keyboard_for(getattr(message.from_user, "id", None), 1),
+        reply_markup=menu_keyboard_for(getattr(message.from_user, "id", None), 1, chat_type=getattr(message.chat, "type", "supergroup")),
     )
     logger.info("User %s triggered /start", getattr(message.from_user, "id", "—"))
 
@@ -4148,12 +4198,17 @@ async def handle_reg(message: Message) -> None:
             f"У тебя уже есть привязка: <b>{name}</b> <code>{tag}</code>\n\n"
             "Если нужно — можешь открыть мини‑приложение и изменить привязку."
         )
-        await _answer_in_thread(message, text, parse_mode="HTML", reply_markup=registration_keyboard())
+        await _answer_in_thread(
+            message,
+            text,
+            parse_mode="HTML",
+            reply_markup=registration_keyboard_for(getattr(message.chat, "type", "supergroup")),
+        )
         return
     await _answer_in_thread(
         registration_prompt_text(message.from_user),
         parse_mode="HTML",
-        reply_markup=registration_keyboard(),
+        reply_markup=registration_keyboard_for(getattr(message.chat, "type", "supergroup")),
         disable_web_page_preview=True,
     )
 
@@ -4708,6 +4763,12 @@ async def main() -> None:
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     global _BOT_INSTANCE
     _BOT_INSTANCE = bot
+    global _BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        _BOT_USERNAME = str(getattr(me, "username", "") or "").strip()
+    except Exception:
+        _BOT_USERNAME = ""
     dp = router_dp
 
     # Render web server (binds to $PORT): health-check + Telegram Mini App.
