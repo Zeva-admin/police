@@ -3022,6 +3022,11 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
     last_fingerprint: str | None = None
     last_sent_at: float = 0.0
 
+    # CWL scan optimization:
+    # When CWL season exists but there is no active/prep war, scanning all wars every 5 minutes is expensive.
+    cwl_next_scan_at: float = 0.0
+    cwl_scan_cooldown_seconds: int = 900  # 15 minutes
+
     # For forum supergroups: pin the reminders into the configured main topic (if set),
     # otherwise they will land in "General".
     topic_tid: int | None = None
@@ -3040,7 +3045,13 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
             end_time = ""
             context = ""
 
-            cwl_tag, cwl_war = await asyncio.to_thread(get_current_cwl_war_for_clan)
+            cwl_tag = None
+            cwl_war = None
+            if time.time() >= cwl_next_scan_at:
+                cwl_tag, cwl_war = await asyncio.to_thread(get_current_cwl_war_for_clan)
+                # If no active/prep CWL war was found, delay the next full scan.
+                if not cwl_tag:
+                    cwl_next_scan_at = time.time() + cwl_scan_cooldown_seconds
             if cwl_tag and isinstance(cwl_war, dict) and not cwl_war.get("_error"):
                 context = "ЛВК"
                 title, missing, state, end_time = get_war_missing_attacks(cwl_war, CLAN_TAG)
@@ -3434,6 +3445,7 @@ async def _ensure_registered_for_message(message: Message) -> bool:
     if uid <= 0:
         # Message sent without from_user (e.g. anonymous admin / channel). We can't link it.
         await _answer_in_thread(
+            message,
             "⚠️ <b>Не вижу, кто отправил команду</b>\n\n"
             "Скорее всего, сообщение отправлено <b>анонимно</b> (от имени канала/админа).\n"
             "Отправь команду от своего аккаунта — и я сразу пришлю кнопку регистрации.",
@@ -3444,6 +3456,7 @@ async def _ensure_registered_for_message(message: Message) -> bool:
     if uid and await is_user_registered(uid):
         return True
     await _answer_in_thread(
+        message,
         registration_prompt_text(message.from_user),
         parse_mode="HTML",
         reply_markup=registration_keyboard_for(getattr(message.chat, "type", "supergroup")),
@@ -4211,6 +4224,7 @@ async def handle_reg(message: Message) -> None:
         )
         return
     await _answer_in_thread(
+        message,
         registration_prompt_text(message.from_user),
         parse_mode="HTML",
         reply_markup=registration_keyboard_for(getattr(message.chat, "type", "supergroup")),
@@ -4379,6 +4393,7 @@ async def handle_find(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await _answer_in_thread(
+            message,
             "🔎 <b>Поиск</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "Напиши:\n"
@@ -4401,6 +4416,7 @@ async def handle_find(message: Message) -> None:
     matches = search_members(members, query)[:20]
     if not matches:
         await _answer_in_thread(
+            message,
             "🔎 <b>Поиск</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"Ничего не найдено по запросу: <code>{_safe(query)}</code>",
