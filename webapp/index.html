@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,viewport-fit=cover"
+    />
+    <title>Регистрация — Clash Bot</title>
+    <link rel="stylesheet" href="/webapp/style.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body>
+    <main class="app" id="app">
+      <header class="header">
+        <div class="badge">Clash • Регистрация</div>
+        <h1>Привяжи аккаунт</h1>
+        <p class="muted">
+          После привязки бот сможет точно отмечать тебя в уведомлениях и не
+          путать игроков.
+        </p>
+      </header>
+
+      <section class="card" id="step-intro">
+        <h2>Как это работает</h2>
+        <ul class="list">
+          <li>
+            Ты вводишь <b>тег</b> деревни (например <code>#QV8CUPJ92</code>).
+          </li>
+          <li>Мы показываем найденного игрока и просим подтвердить.</li>
+          <li>
+            Ты берёшь <b>авторизационный токен</b> в игре и вводишь его сюда.
+          </li>
+        </ul>
+
+        <div class="note">
+          <b>Важно:</b> этот токен <b>не даёт доступ</b> к аккаунту и не влияет
+          на игру. Он нужен только, чтобы подтвердить, что деревня действительно
+          твоя. Токен живёт недолго, обычно около пары минут.
+        </div>
+
+        <div class="row">
+          <button class="btn primary" id="btn-start">Далее</button>
+        </div>
+      </section>
+
+      <section class="card hidden" id="step-tag">
+        <h2>Шаг 1 — тег деревни</h2>
+        <p class="muted" id="tg-user-line"></p>
+        <label class="label" for="tag-input">Тег</label>
+        <div class="inputRow">
+          <input
+            id="tag-input"
+            class="input"
+            inputmode="text"
+            autocomplete="off"
+            placeholder="#QV8CUPJ92"
+          />
+          <button class="btn" id="btn-lookup">Найти</button>
+        </div>
+        <p class="hint">
+          Можно с <code>#</code> или без. Пример: <code>QV8CUPJ92</code>.
+        </p>
+        <div class="status" id="status-tag"></div>
+      </section>
+
+      <section class="card hidden" id="step-confirm">
+        <h2>Проверь игрока</h2>
+        <div class="playerCard" id="player-card"></div>
+        <div class="row">
+          <button class="btn primary" id="btn-yes">Это я</button>
+          <button class="btn danger" id="btn-no">Нет, другой тег</button>
+        </div>
+      </section>
+
+      <section class="card hidden" id="step-token">
+        <h2>Шаг 2 — токен из игры</h2>
+        <p class="muted">
+          В игре: <b>Настройки</b> → <b>Дополнительные настройки</b> → кнопка
+          <b>Авторизационный токен</b>.
+        </p>
+        <label class="label" for="token-input">Токен</label>
+        <div class="inputRow">
+          <input
+            id="token-input"
+            class="input"
+            inputmode="text"
+            autocomplete="off"
+            placeholder="например rdckezca"
+          />
+          <button class="btn primary" id="btn-verify">Подтвердить</button>
+        </div>
+        <div class="status" id="status-token"></div>
+      </section>
+
+      <section class="card hidden" id="step-done">
+        <h2>Готово</h2>
+        <p class="muted" id="done-text"></p>
+        <div class="row">
+          <button class="btn primary" id="btn-close">Закрыть</button>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <span class="muted">Если что-то не проходит — просто попробуй ещё раз.</span>
+      </footer>
+    </main>
+
+    <script src="/webapp/app.js"></script>
+  </body>
+</html>
+

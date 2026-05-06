@@ -1,0 +1,194 @@
+:root{
+  --bg:#0b0f14;
+  --card:#111823;
+  --card2:#0f1620;
+  --text:#e6edf3;
+  --muted:#9fb0c0;
+  --border:rgba(255,255,255,.08);
+  --primary:#2f81f7;
+  --danger:#ff4d4d;
+  --ok:#2ecc71;
+  --warn:#f1c40f;
+  --shadow:0 18px 60px rgba(0,0,0,.45);
+  --radius:18px;
+  --radius2:14px;
+  --mono:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+  --sans:system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif;
+}
+
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  font-family:var(--sans);
+  color:var(--text);
+  background:radial-gradient(1200px 700px at 20% 0%, rgba(47,129,247,.16), transparent 55%),
+             radial-gradient(900px 700px at 90% 10%, rgba(46,204,113,.10), transparent 55%),
+             var(--bg);
+}
+
+.app{
+  max-width:720px;
+  margin:0 auto;
+  padding:20px 16px 28px;
+}
+
+.header{
+  padding:10px 6px 8px;
+}
+.badge{
+  display:inline-block;
+  padding:7px 10px;
+  border:1px solid var(--border);
+  border-radius:999px;
+  background:rgba(255,255,255,.03);
+  color:var(--muted);
+  font-size:12px;
+  letter-spacing:.2px;
+}
+.header h1{
+  margin:10px 0 6px;
+  font-size:28px;
+  line-height:1.2;
+}
+.muted{color:var(--muted)}
+
+.card{
+  background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015));
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  box-shadow:var(--shadow);
+  padding:16px;
+  margin:14px 0;
+}
+.card h2{
+  margin:0 0 10px;
+  font-size:18px;
+}
+.list{
+  margin:10px 0 0;
+  padding-left:18px;
+}
+.list li{margin:8px 0}
+
+code{
+  font-family:var(--mono);
+  font-size:.95em;
+  padding:2px 6px;
+  border:1px solid var(--border);
+  border-radius:10px;
+  background:rgba(0,0,0,.28);
+  color:#d9e6ff;
+}
+
+.note{
+  margin-top:12px;
+  padding:12px 12px;
+  border-radius:var(--radius2);
+  border:1px solid rgba(47,129,247,.28);
+  background:rgba(47,129,247,.08);
+}
+
+.row{
+  display:flex;
+  gap:10px;
+  margin-top:14px;
+  flex-wrap:wrap;
+}
+
+.btn{
+  border:1px solid var(--border);
+  background:rgba(255,255,255,.04);
+  color:var(--text);
+  padding:10px 14px;
+  border-radius:14px;
+  cursor:pointer;
+  font-weight:600;
+  transition:transform .05s ease, background .15s ease, border-color .15s ease;
+}
+.btn:hover{background:rgba(255,255,255,.07); border-color:rgba(255,255,255,.14)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{
+  background:rgba(47,129,247,.18);
+  border-color:rgba(47,129,247,.40);
+}
+.btn.primary:hover{background:rgba(47,129,247,.24)}
+.btn.danger{
+  background:rgba(255,77,77,.12);
+  border-color:rgba(255,77,77,.35);
+}
+.btn.danger:hover{background:rgba(255,77,77,.17)}
+
+.label{
+  display:block;
+  margin:8px 0 6px;
+  font-weight:700;
+}
+.inputRow{display:flex; gap:10px; align-items:center}
+.input{
+  flex:1;
+  min-width:0;
+  border:1px solid var(--border);
+  background:rgba(0,0,0,.18);
+  color:var(--text);
+  padding:12px 12px;
+  border-radius:14px;
+  outline:none;
+  font-family:var(--mono);
+  font-size:14px;
+}
+.input:focus{border-color:rgba(47,129,247,.55)}
+.hint{margin:8px 0 0; font-size:12.5px; color:var(--muted)}
+
+.status{
+  margin-top:12px;
+  padding:12px 12px;
+  border-radius:14px;
+  border:1px solid var(--border);
+  background:rgba(0,0,0,.14);
+  min-height:44px;
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+.pill{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  padding:6px 10px;
+  border-radius:999px;
+  border:1px solid var(--border);
+  background:rgba(255,255,255,.03);
+  font-size:12px;
+  color:var(--muted);
+}
+.dot{width:8px; height:8px; border-radius:999px; background:var(--warn)}
+.dot.ok{background:var(--ok)}
+.dot.bad{background:var(--danger)}
+
+.playerCard{
+  background:rgba(0,0,0,.16);
+  border:1px solid var(--border);
+  border-radius:var(--radius2);
+  padding:12px;
+}
+.playerLine{
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  padding:6px 0;
+  border-bottom:1px dashed rgba(255,255,255,.06);
+}
+.playerLine:last-child{border-bottom:none}
+.playerKey{color:var(--muted)}
+.playerVal{font-weight:700}
+
+.hidden{display:none!important}
+
+.footer{
+  margin-top:14px;
+  text-align:center;
+  font-size:12px;
+  opacity:.9;
+}
+
