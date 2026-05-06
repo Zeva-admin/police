@@ -2841,11 +2841,11 @@ def _format_missing_block(missing: list[str], limit: int = 20) -> str:
 
 async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
     """
-    Auto broadcasts war/CWL milestone notifications as NEW messages:
-    - start
-    - ~1/3 passed
-    - ~2/3 passed
-    - last hour
+    Auto broadcasts war/CWL milestone notifications as NEW messages (no spam):
+    Exactly 4 key moments per war:
+    - start (when war becomes inWar)
+    - mid (примерно середина войны)
+    - last hour (or final minutes)
     - end result
     """
     # Polling interval: keep it calm to avoid spam and rate limits.
@@ -2973,11 +2973,12 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     th = m.get("townhallLevel", m.get("townHallLevel", "?"))
                     name_html = _maybe_mention_player(raw_name, m.get("tag"))
                     missing_lines.append(f"{name_html} (TH{th}) — {used}/{attacks_per_member}")
-
+ 
             # Milestones (dedup even if the loop restarts)
             war_sent = _broadcast_sent.get(active_id or "", {})
             now_ts = time.time()
-            def _can_send(key: str, cooldown_sec: int = 6 * 3600) -> bool:
+
+            def _can_send(key: str, cooldown_sec: int = 48 * 3600) -> bool:
                 last = float(war_sent.get(key, 0.0) or 0.0)
                 return (now_ts - last) >= cooldown_sec
 
@@ -2985,7 +2986,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                 time_left = _time_left(str(war.get("endTime") or ""))
 
                 # Send at most ONE reminder per loop tick (so it doesn't spam in bursts)
-                if "start" not in sent and _can_send("start", 12 * 3600):
+                if "start" not in sent and _can_send("start"):
                     text = (
                         f"🔥 <b>{kind} началась!</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2997,7 +2998,18 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     await _send(text)
                     sent.add("start")
                     war_sent["start"] = now_ts
-                elif remaining <= 3600 and remaining > 0 and "last_hour" not in sent and _can_send("last_hour", 6 * 3600):
+                elif elapsed >= int(duration * 0.50) and "mid" not in sent and remaining > 3600 and _can_send("mid"):
+                    text = (
+                        f"⏱️ <b>{kind}: середина войны</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"До конца: <b>{_safe(time_left)}</b>\n"
+                        f"Против: <b>{opp_name}</b>\n\n"
+                        f"{_format_missing_block(missing_lines)}"
+                    )
+                    await _send(text)
+                    sent.add("mid")
+                    war_sent["mid"] = now_ts
+                elif remaining <= 3600 and remaining > 0 and "last_hour" not in sent and _can_send("last_hour"):
                     urgent_label = "финальные минуты" if remaining <= 600 else "последний час"
                     text = (
                         f"🚨 <b>{kind}: {urgent_label}!</b>\n"
@@ -3008,35 +3020,14 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     await _send(text)
                     sent.add("last_hour")
                     war_sent["last_hour"] = now_ts
-                elif elapsed >= int(duration * 0.67) and "twothirds" not in sent and remaining > 3600 and _can_send("twothirds", 6 * 3600):
-                    text = (
-                        f"⚠️ <b>{kind}: прошло две трети</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"До конца: <b>{_safe(time_left)}</b>\n\n"
-                        f"{_format_missing_block(missing_lines)}"
-                    )
-                    await _send(text)
-                    sent.add("twothirds")
-                    war_sent["twothirds"] = now_ts
-                elif elapsed >= int(duration * 0.33) and "third" not in sent and remaining > 3600 and _can_send("third", 6 * 3600):
-                    text = (
-                        f"⏱️ <b>{kind}: прошла треть</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"До конца: <b>{_safe(time_left)}</b>\n"
-                        f"Против: <b>{opp_name}</b>\n\n"
-                        f"{_format_missing_block(missing_lines)}"
-                    )
-                    await _send(text)
-                    sent.add("third")
-                    war_sent["third"] = now_ts
 
                 if active_id:
                     # store back
                     _broadcast_sent[active_id] = war_sent
 
-            # 5) End result
+            # 4) End result
             if state == "warEnded" or remaining <= 0:
-                if "end" not in sent and _can_send("end", 24 * 3600):
+                if "end" not in sent and _can_send("end", 7 * 24 * 3600):
                     # Refresh data for final numbers (especially CWL war)
                     final_war = war
                     if kind == "ЛВК" and active_war_tag:
@@ -3958,7 +3949,7 @@ async def cb_notify(query: CallbackQuery) -> None:
         return
 
     bot = query.bot
-    task = asyncio.create_task(_notify_loop(bot, target_chat_id))
+    task = asyncio.create_task(_broadcast_milestones_loop(bot, target_chat_id))
     _notify_tasks[target_chat_id] = task
 
     if getattr(source_chat, "type", "") not in {"group", "supergroup"} and target_chat_id == source_chat.id:
@@ -4012,7 +4003,11 @@ async def cb_notify(query: CallbackQuery) -> None:
 
     text = (
         "🔔 <b>Уведомления включены</b>\n\n"
-        "Теперь я буду писать напоминания в клановый чат (одним обновляемым сообщением).\n\n"
+        "Я напишу <b>4 уведомления</b> за КВ/ЛВК:\n"
+        "• старт\n"
+        "• середина\n"
+        "• последний час\n"
+        "• итог\n\n"
         "<i>Нажми кнопку ещё раз, чтобы выключить.</i>"
     )
     await _edit_or_send(query.message, text, main_menu_keyboard())
@@ -4896,7 +4891,7 @@ async def main() -> None:
     except Exception:
         pass
 
-    # Auto notifications for clan chat (single updating message, no spam)
+    # Auto notifications for clan chat (4 milestone messages per war)
     try:
         if isinstance(CHAT_ID, int) and CHAT_ID != 0:
             if CHAT_ID not in _notify_tasks or _notify_tasks[CHAT_ID].done():
@@ -4906,7 +4901,7 @@ async def main() -> None:
                     # Prime a group menu message so the bot is usable in groups even with Privacy Mode on.
                     # (Users can always interact via inline callbacks from this message.)
                     await _prime_group_menu(bot)
-                    _notify_tasks[CHAT_ID] = asyncio.create_task(_notify_loop(bot, CHAT_ID))
+                    _notify_tasks[CHAT_ID] = asyncio.create_task(_broadcast_milestones_loop(bot, CHAT_ID))
                     logger.info("Auto notifications enabled for chat %s", CHAT_ID)
                 except Exception as exc:
                     logger.warning("Auto notifications disabled: cannot access chat %s (%s)", CHAT_ID, exc)
