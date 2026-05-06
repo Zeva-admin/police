@@ -40,7 +40,7 @@ try:
 except Exception:
     asyncpg = None
 
-TELEGRAM_BOT_TOKEN: str = "8527467590:AAErJnjBo4V9i3mGpzLRqqGDcQ1Q6rwrpU8"
+TELEGRAM_BOT_TOKEN: str = "8475734533:AAGKGG72h0KyFWfhzvc2BPj-ZtZ9xBOGWUU"
 
 # Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
@@ -78,6 +78,11 @@ _webapp_sessions: dict[str, dict] = {}
 _links_cache: dict[str, int] = {}  # COC_TAG -> telegram_user_id
 _links_cache_loaded_at: float = 0.0
 LINKS_CACHE_TTL_SECONDS: int = 300  # 5 minutes
+_tg_links_cache: dict[int, dict] = {}  # telegram_user_id -> {coc_tag, coc_name, verified_at}
+_tg_links_cache_loaded_at: float = 0.0
+
+# Bot instance for WebApp handlers (set in main)
+_BOT_INSTANCE: Bot | None = None
 
 # Local time formatting for UI (UTC offset). Ashgabat is UTC+5.
 LOCAL_UTC_OFFSET_HOURS: int = 5
@@ -829,6 +834,19 @@ def _mention_html(user_id: int, visible_name: str) -> str:
     return f'<a href="tg://user?id={int(user_id)}">{_safe(visible_name)}</a>'
 
 
+def _tg_user_display(user: object) -> str:
+    """
+    Format human-friendly mention for aiogram User.
+    Uses tg://user?id=... (works even without username).
+    """
+    try:
+        uid = int(getattr(user, "id", 0) or 0)
+        first_name = str(getattr(user, "first_name", "") or "пользователь")
+        return _mention_html(uid, first_name)
+    except Exception:
+        return "<b>пользователь</b>"
+
+
 async def _pg_get_pool():
     global _pg_pool
     if asyncpg is None:
@@ -913,6 +931,70 @@ async def _refresh_links_cache(force: bool = False) -> None:
         _links_cache_loaded_at = now
     except Exception as exc:
         logger.warning("Links cache refresh failed: %s", exc)
+
+
+async def _refresh_tg_links_cache(force: bool = False) -> None:
+    global _tg_links_cache_loaded_at, _tg_links_cache
+    now = time.time()
+    if not force and (now - _tg_links_cache_loaded_at) < LINKS_CACHE_TTL_SECONDS:
+        return
+    try:
+        pool = await _pg_get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT telegram_user_id, coc_tag, coc_name, verified_at FROM coc_links"
+            )
+        new_map: dict[int, dict] = {}
+        for r in rows:
+            try:
+                new_map[int(r["telegram_user_id"])] = {
+                    "coc_tag": _norm_tag(r["coc_tag"]),
+                    "coc_name": str(r["coc_name"] or ""),
+                    "verified_at": str(r["verified_at"] or ""),
+                }
+            except Exception:
+                continue
+        _tg_links_cache = new_map
+        _tg_links_cache_loaded_at = now
+    except Exception as exc:
+        logger.warning("TG links cache refresh failed: %s", exc)
+
+
+async def is_user_registered(telegram_user_id: int) -> bool:
+    if not telegram_user_id:
+        return False
+    await _refresh_tg_links_cache()
+    return int(telegram_user_id) in _tg_links_cache
+
+
+async def get_user_link(telegram_user_id: int) -> dict | None:
+    if not telegram_user_id:
+        return None
+    await _refresh_tg_links_cache()
+    return _tg_links_cache.get(int(telegram_user_id))
+
+
+def registration_prompt_text(user) -> str:
+    who = _tg_user_display(user)
+    return (
+        f"{who}, чтобы пользоваться ботом, нужно один раз привязать аккаунт Clash of Clans.\n\n"
+        "Это займёт пару минут: тег → подтверждение → токен из игры."
+    )
+
+
+def registration_keyboard() -> InlineKeyboardMarkup:
+    wa_url = miniapp_https_url()
+    if wa_url:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Зарегистрироваться", web_app=WebAppInfo(url=wa_url))],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")],
+        ]
+    )
 
 
 def _maybe_mention_player(name: str, player_tag: str | None) -> str:
@@ -2961,11 +3043,68 @@ async def http_api_verify(request: web.Request) -> web.Response:
         )
         # Update cache immediately for mentions
         _links_cache[_norm_tag(tag)] = int(user.get("id"))
+        _tg_links_cache[int(user.get("id"))] = {
+            "coc_tag": _norm_tag(tag),
+            "coc_name": str((player or {}).get("name") or ""),
+            "verified_at": str(datetime.now(timezone.utc).isoformat()),
+        }
     except Exception as exc:
         logger.error("DB upsert failed: %s", exc)
         return _json_error("Не удалось сохранить привязку. Попробуй ещё раз.", 502)
 
+    # Notify clan chat (optional)
+    try:
+        if _BOT_INSTANCE and isinstance(CHAT_ID, int) and CHAT_ID != 0:
+            tg_name = str(user.get("first_name") or "игрок")
+            mention = _mention_html(int(user.get("id")), tg_name)
+            coc_name = _safe((player or {}).get("name") or "Игрок")
+            await _BOT_INSTANCE.send_message(
+                CHAT_ID,
+                f"✅ {mention} привязал аккаунт: <b>{coc_name}</b> <code>{_safe(tag)}</code>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+    except Exception:
+        pass
+
     return web.json_response({"ok": True, "player": _pick_player_public_fields(player or {})})
+
+
+async def http_api_me(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    init_data = str((payload or {}).get("initData") or "")
+    user = _validate_webapp_init_data(init_data)
+    if not user:
+        return _json_error("Открой это окно через кнопку в боте и попробуй ещё раз.", 403)
+
+    try:
+        await _pg_ensure_schema()
+        link = await get_user_link(int(user.get("id")))
+        if not link:
+            return web.json_response({"ok": True, "linked": False})
+        tag = _norm_tag(link.get("coc_tag"))
+        player = await asyncio.to_thread(get_player_info, tag)
+        if isinstance(player, dict) and not player.get("_error"):
+            return web.json_response(
+                {
+                    "ok": True,
+                    "linked": True,
+                    "player": _pick_player_public_fields(player),
+                }
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "linked": True,
+                "player": {"name": str(link.get("coc_name") or ""), "tag": tag},
+            }
+        )
+    except Exception as exc:
+        return _json_error(f"Не удалось загрузить данные ({exc})", 502)
 
 
 async def start_render_server() -> web.AppRunner:
@@ -2985,6 +3124,7 @@ async def start_render_server() -> web.AppRunner:
         app.router.add_static("/webapp/", WEBAPP_DIR, show_index=False)
     app.router.add_post("/api/lookup", http_api_lookup)
     app.router.add_post("/api/verify", http_api_verify)
+    app.router.add_post("/api/me", http_api_me)
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -3001,6 +3141,45 @@ async def start_render_server() -> web.AppRunner:
 router_dp = Dispatcher()
 
 
+async def _ensure_registered_for_message(message: Message) -> bool:
+    if _is_owner(message):
+        return True
+    try:
+        uid = int(message.from_user.id) if message.from_user else 0
+    except Exception:
+        uid = 0
+    if uid and await is_user_registered(uid):
+        return True
+    await message.answer(
+        registration_prompt_text(message.from_user),
+        parse_mode="HTML",
+        reply_markup=registration_keyboard(),
+        disable_web_page_preview=True,
+    )
+    return False
+
+
+async def _ensure_registered_for_query(query: CallbackQuery) -> bool:
+    try:
+        uid = int(query.from_user.id) if query.from_user else 0
+    except Exception:
+        uid = 0
+    if uid and uid == int(OWNER_USER_ID):
+        return True
+    if uid and await is_user_registered(uid):
+        return True
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    await _edit_or_send(
+        query.message,
+        registration_prompt_text(query.from_user),
+        registration_keyboard(),
+    )
+    return False
+
+
 @router_dp.callback_query(F.data == "noop")
 async def cb_noop(query: CallbackQuery) -> None:
     await query.answer()
@@ -3009,18 +3188,24 @@ async def cb_noop(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:home")
 async def cb_home(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(1))
 
 
 @router_dp.callback_query(F.data == "menu:more")
 async def cb_more(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(2))
 
 
 @router_dp.callback_query(F.data == "menu:back")
 async def cb_back(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(1))
 
 
@@ -3039,6 +3224,8 @@ async def cb_webapp_info(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:clan")
 async def cb_clan(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     data = await _api(get_clan_info, CLAN_TAG)
     err = check_api_error(data, context="clan info (menu)")
     if err:
@@ -3052,6 +3239,8 @@ async def cb_clan(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data.startswith("menu:members:"))
 async def cb_members(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     try:
         page = int(str(query.data).split(":")[-1])
     except Exception:
@@ -3071,6 +3260,8 @@ async def cb_members(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:war")
 async def cb_war(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     data = await _api(get_current_war, CLAN_TAG)
     err = check_api_error(data, context="current war (menu)")
     if err:
@@ -3084,6 +3275,8 @@ async def cb_war(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:top")
 async def cb_top(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="top members (menu)")
     if err:
@@ -3128,6 +3321,8 @@ async def cb_top(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:donations")
 async def cb_donations(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="donations (menu)")
     if err:
@@ -3171,6 +3366,8 @@ async def cb_donations(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data.startswith("menu:member:"))
 async def cb_member_profile(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     parts = str(query.data).split(":")
     # menu:member:<page>:<TAGWITHOUT#>
     page = 1
@@ -3222,6 +3419,8 @@ async def cb_member_profile(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:find")
 async def cb_find(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     text = (
         "🔎 <b>Поиск по участникам</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -3236,6 +3435,8 @@ async def cb_find(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:link")
 async def cb_link(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     url = clan_profile_url(CLAN_TAG)
     text = (
         "🔗 <b>Ссылка на клан</b>\n"
@@ -3255,6 +3456,8 @@ async def cb_link(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:leaders")
 async def cb_leaders(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="leaders (menu)")
     if err:
@@ -3267,6 +3470,8 @@ async def cb_leaders(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:pstats")
 async def cb_player_stats_menu(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="player stats list")
     if err:
@@ -3280,6 +3485,8 @@ async def cb_player_stats_menu(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data.startswith("pstats:pick:"))
 async def cb_player_stats_pick(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     raw = str(query.data or "")
     parts = raw.split(":")
     if len(parts) < 3:
@@ -3309,6 +3516,8 @@ async def cb_player_stats_pick(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data.startswith("pstats:refresh:"))
 async def cb_player_stats_refresh(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     raw = str(query.data or "")
     parts = raw.split(":")
     if len(parts) < 3:
@@ -3345,6 +3554,8 @@ async def cb_player_stats_refresh(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:notify")
 async def cb_notify(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
 
     source_chat = query.message.chat
     target_chat_id = int(CHAT_ID) if isinstance(CHAT_ID, int) and CHAT_ID != 0 else source_chat.id
@@ -3417,6 +3628,8 @@ async def cb_notify(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:warlog")
 async def cb_warlog(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
 
     info = await _api(get_clan_info, CLAN_TAG)
     info_err = check_api_error(info, context="warlog clan info (menu)")
@@ -3445,6 +3658,8 @@ async def cb_warlog(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:capital")
 async def cb_capital(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     data = await _api(get_capital_raid_seasons, 1)
     err = check_api_error(data, context="capital raids (menu)")
     if err:
@@ -3456,6 +3671,8 @@ async def cb_capital(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data == "menu:cwl")
 async def cb_cwl(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     global _CLAN_WARLEAGUE_CACHED
     data = await _api(get_cwl_group)
     if isinstance(data, dict) and data.get("_error") == "not_found":
@@ -3574,6 +3791,8 @@ async def cb_cwl(query: CallbackQuery) -> None:
 @router_dp.callback_query(F.data.startswith("cwl:round:"))
 async def cb_cwl_round(query: CallbackQuery) -> None:
     await query.answer()
+    if not await _ensure_registered_for_query(query):
+        return
     try:
         round_num = int(str(query.data).split(":")[-1])
     except Exception:
@@ -3627,8 +3846,76 @@ async def cb_cwl_round(query: CallbackQuery) -> None:
 @router_dp.message(Command("start"))
 async def handle_start(message: Message) -> None:
     """Главное меню бота."""
+    if not await _ensure_registered_for_message(message):
+        return
     await message.answer(build_home_text(), parse_mode="HTML", reply_markup=main_menu_keyboard(1))
     logger.info("User %s triggered /start", message.from_user.id)
+
+
+@router_dp.message(Command("reg"))
+async def handle_reg(message: Message) -> None:
+    """Показать кнопку регистрации (Mini App)."""
+    try:
+        uid = int(message.from_user.id) if message.from_user else 0
+    except Exception:
+        uid = 0
+    if uid and await is_user_registered(uid):
+        link = await get_user_link(uid)
+        tag = _safe((link or {}).get("coc_tag") or "")
+        name = _safe((link or {}).get("coc_name") or "Игрок")
+        text = (
+            "✅ <b>Регистрация</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"У тебя уже есть привязка: <b>{name}</b> <code>{tag}</code>\n\n"
+            "Если нужно — можешь открыть мини‑приложение и изменить привязку."
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=registration_keyboard())
+        return
+    await message.answer(
+        registration_prompt_text(message.from_user),
+        parse_mode="HTML",
+        reply_markup=registration_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+@router_dp.message(Command("json"))
+async def handle_json(message: Message) -> None:
+    """Отправить владельцу JSON со всеми регистрациями."""
+    if not _is_owner(message):
+        return
+    if asyncpg is None:
+        await message.answer("⚠️ asyncpg не установлен.", parse_mode="HTML")
+        return
+    try:
+        await _pg_ensure_schema()
+        pool = await _pg_get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT telegram_user_id, coc_tag, coc_name, tg_username, tg_first_name, verified_at, updated_at FROM coc_links ORDER BY updated_at DESC"
+            )
+        data = []
+        for r in rows:
+            data.append(
+                {
+                    "telegram_user_id": int(r["telegram_user_id"]),
+                    "coc_tag": str(r["coc_tag"]),
+                    "coc_name": str(r["coc_name"]),
+                    "tg_username": str(r["tg_username"]),
+                    "tg_first_name": str(r["tg_first_name"]),
+                    "verified_at": str(r["verified_at"]),
+                    "updated_at": str(r["updated_at"]),
+                }
+            )
+        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        file = BufferedInputFile(payload, filename="registrations.json")
+        target = int(OWNER_USER_ID)
+        try:
+            await message.bot.send_document(target, file, caption="Регистрации (JSON)")
+        except Exception:
+            await message.answer_document(file, caption="Регистрации (JSON)")
+    except Exception as exc:
+        await message.answer(f"⚠️ Не удалось собрать JSON: {_safe(exc)}", parse_mode="HTML")
 
 
 @router_dp.message(Command("reset"))
@@ -3723,6 +4010,8 @@ async def handle_chatid(message: Message) -> None:
 @router_dp.message(Command("find"))
 async def handle_find(message: Message) -> None:
     """Поиск по участникам клана по нику/тегу."""
+    if not await _ensure_registered_for_message(message):
+        return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.answer(
@@ -3797,6 +4086,8 @@ async def handle_find(message: Message) -> None:
 @router_dp.message(Command("help"))
 async def handle_help(message: Message) -> None:
     """Краткая справка (русский интерфейс)."""
+    if not await _ensure_registered_for_message(message):
+        return
     text = (
         "ℹ️ <b>Справка</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -3813,6 +4104,8 @@ async def handle_help(message: Message) -> None:
 async def handle_clan(message: Message) -> None:
     """Показать информацию о клане (по умолчанию — CLAN_TAG)."""
     logger.info("User %s triggered /clan", message.from_user.id)
+    if not await _ensure_registered_for_message(message):
+        return
 
     clan_tag = extract_tag_arg(message.text, default_tag=CLAN_TAG)
     if clan_tag is None:
@@ -3840,6 +4133,8 @@ async def handle_player(message: Message) -> None:
     Пример: /player #2PP
     """
     logger.info("User %s triggered /player", message.from_user.id)
+    if not await _ensure_registered_for_message(message):
+        return
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -3878,6 +4173,8 @@ async def handle_player(message: Message) -> None:
 async def handle_war(message: Message) -> None:
     """Показать текущую войну клана (CLAN_TAG)."""
     logger.info("User %s triggered /war", message.from_user.id)
+    if not await _ensure_registered_for_message(message):
+        return
 
     data = await _api(get_current_war, CLAN_TAG)
     err = check_api_error(data, context="current war")
@@ -3892,6 +4189,8 @@ async def handle_war(message: Message) -> None:
 async def handle_members(message: Message) -> None:
     """Показать участников клана (страница 1)."""
     logger.info("User %s triggered /members", message.from_user.id)
+    if not await _ensure_registered_for_message(message):
+        return
 
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="clan members")
@@ -3908,6 +4207,8 @@ async def handle_members(message: Message) -> None:
 async def handle_top(message: Message) -> None:
     """Топ 10 участников клана по трофеям."""
     logger.info("User %s triggered /top", message.from_user.id)
+    if not await _ensure_registered_for_message(message):
+        return
 
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="top members")
@@ -3960,6 +4261,8 @@ async def handle_top(message: Message) -> None:
 async def handle_donations(message: Message) -> None:
     """Топ донатеров клана за сезон."""
     logger.info("User %s triggered /donations", message.from_user.id)
+    if not await _ensure_registered_for_message(message):
+        return
 
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="donations")
@@ -4097,6 +4400,12 @@ async def main() -> None:
     except Exception:
         pass
 
+    # Initialize bot instance early (used by WebApp verification handler for announcements)
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    global _BOT_INSTANCE
+    _BOT_INSTANCE = bot
+    dp = router_dp
+
     # Render web server (binds to $PORT): health-check + Telegram Mini App.
     server_runner = await start_render_server()
 
@@ -4115,13 +4424,10 @@ async def main() -> None:
     try:
         await _pg_ensure_schema()
         await _refresh_links_cache(force=True)
+        await _refresh_tg_links_cache(force=True)
         logger.info("Supabase: connected")
     except Exception as exc:
         logger.warning("Supabase: not connected (%s)", exc)
-
-    # Initialize bot and dispatcher
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    dp = router_dp
 
     # Auto notifications for clan chat (new messages, milestone-based)
     try:
