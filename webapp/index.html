@@ -13,30 +13,24 @@
   <body>
     <main class="app" id="app">
       <header class="header">
-        <div class="badge">Clash • Регистрация</div>
-        <h1>Привяжи аккаунт</h1>
+        <div class="badge">Регистрация</div>
+        <h1>Привязка аккаунта</h1>
         <p class="muted">
-          После привязки бот сможет точно отмечать тебя в уведомлениях и не
-          путать игроков.
+          Чтобы бот мог отмечать тебя в уведомлениях и не путал игроков.
         </p>
       </header>
 
       <section class="card" id="step-intro">
-        <h2>Как это работает</h2>
-        <ul class="list">
-          <li>
-            Ты вводишь <b>тег</b> деревни (например <code>#QV8CUPJ92</code>).
-          </li>
-          <li>Мы показываем найденного игрока и просим подтвердить.</li>
-          <li>
-            Ты берёшь <b>авторизационный токен</b> в игре и вводишь его сюда.
-          </li>
-        </ul>
+        <h2>Пару минут — и готово</h2>
+        <p class="muted">
+          Всё просто:
+          <b>вводишь тег</b> → <b>проверяешь ник</b> → <b>вводишь токен из игры</b>.
+        </p>
 
         <div class="note">
-          <b>Важно:</b> этот токен <b>не даёт доступ</b> к аккаунту и не влияет
-          на игру. Он нужен только, чтобы подтвердить, что деревня действительно
-          твоя. Токен живёт недолго, обычно около пары минут.
+          <b>Важно:</b> этот токен не даёт доступ к аккаунту и ни на что не влияет.
+          Он нужен только для проверки, что деревня действительно твоя.
+          Токен живёт недолго (обычно около пары минут).
         </div>
 
         <div class="row">
@@ -58,9 +52,7 @@
           />
           <button class="btn" id="btn-lookup">Найти</button>
         </div>
-        <p class="hint">
-          Можно с <code>#</code> или без. Пример: <code>QV8CUPJ92</code>.
-        </p>
+        <p class="hint">Можно с <code>#</code> или без. Пример: <code>QV8CUPJ92</code>.</p>
         <div class="status" id="status-tag"></div>
       </section>
 
@@ -76,8 +68,7 @@
       <section class="card hidden" id="step-token">
         <h2>Шаг 2 — токен из игры</h2>
         <p class="muted">
-          В игре: <b>Настройки</b> → <b>Дополнительные настройки</b> → кнопка
-          <b>Авторизационный токен</b>.
+          В игре: <b>Настройки</b> → <b>Доп. настройки</b> → <b>Авторизационный токен</b>.
         </p>
         <label class="label" for="token-input">Токен</label>
         <div class="inputRow">
@@ -98,15 +89,15 @@
         <p class="muted" id="done-text"></p>
         <div class="row">
           <button class="btn primary" id="btn-close">Закрыть</button>
+          <button class="btn" id="btn-change">Изменить привязку</button>
         </div>
       </section>
 
       <footer class="footer">
-        <span class="muted">Если что-то не проходит — просто попробуй ещё раз.</span>
+        <span class="muted">Если что-то не прошло — просто попробуй ещё раз.</span>
       </footer>
     </main>
 
     <script src="/webapp/app.js"></script>
   </body>
 </html>
-
