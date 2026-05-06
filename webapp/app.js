@@ -33,6 +33,17 @@
   const btnVerify = $("btn-verify");
   const btnClose = $("btn-close");
   const btnChange = $("btn-change");
+  const btnUnlink = $("btn-unlink");
+
+  const btnMenu = $("btn-menu");
+  const drawer = $("drawer");
+  const backdrop = $("backdrop");
+  const drawerMe = $("drawer-me");
+  const drawerChange = $("drawer-change");
+  const drawerUnlink = $("drawer-unlink");
+  const drawerClose = $("drawer-close");
+
+  const meCard = $("me-card");
 
   let initData = "";
   let selectedTag = "";
@@ -44,6 +55,15 @@
     );
     el.classList.remove("hidden");
     window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function openDrawer() {
+    drawer.classList.remove("hidden");
+    backdrop.classList.remove("hidden");
+  }
+  function closeDrawer() {
+    drawer.classList.add("hidden");
+    backdrop.classList.add("hidden");
   }
 
   function normTag(raw) {
@@ -61,13 +81,34 @@
   }
 
   function setStatus(el, type, text) {
-    const dotClass = type === "ok" ? "ok" : type === "bad" ? "bad" : "";
     const label =
       type === "ok" ? "Готово" : type === "bad" ? "Ошибка" : "Проверяю";
+    const pillClass = type === "ok" ? "ok" : type === "bad" ? "bad" : "info";
+    const icon = statusIconSvg(type);
     el.innerHTML = `
-      <span class="pill"><span class="dot ${dotClass}"></span>${label}</span>
+      <span class="pill ${pillClass}"><span class="pillIcon">${icon}</span>${label}</span>
       <span>${text || ""}</span>
     `;
+  }
+
+  function statusIconSvg(type) {
+    if (type === "ok") {
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9.2 16.6 4.9 12.3a1.2 1.2 0 1 1 1.7-1.7l2.6 2.6 8.2-8.2a1.2 1.2 0 1 1 1.7 1.7l-9.9 9.9a1.2 1.2 0 0 1-1.7 0Z"/>
+        </svg>`;
+    }
+    if (type === "bad") {
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M13.7 12 18.3 7.4a1.2 1.2 0 0 0-1.7-1.7L12 10.3 7.4 5.7a1.2 1.2 0 1 0-1.7 1.7L10.3 12l-4.6 4.6a1.2 1.2 0 1 0 1.7 1.7l4.6-4.6 4.6 4.6a1.2 1.2 0 0 0 1.7-1.7L13.7 12Z"/>
+        </svg>`;
+    }
+    // info/loading
+    return `
+      <svg class="spin" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 3.2a8.8 8.8 0 1 0 8.8 8.8 1.2 1.2 0 1 0-2.4 0A6.4 6.4 0 1 1 12 5.6a1.2 1.2 0 1 0 0-2.4Z"/>
+      </svg>`;
   }
 
   async function api(path, payload) {
@@ -97,6 +138,30 @@
       ["Клан", (player.clan && player.clan.name) || "Без клана"],
     ];
     playerCard.innerHTML = rows
+      .map(
+        ([k, v]) => `
+        <div class="playerLine">
+          <div class="playerKey">${k}</div>
+          <div class="playerVal">${escapeHtml(v)}</div>
+        </div>`
+      )
+      .join("");
+  }
+
+  function renderMeCard(player) {
+    if (!meCard) return;
+    if (!player || !player.tag) {
+      meCard.innerHTML = "";
+      return;
+    }
+    const rows = [
+      ["Ник", player.name || "—"],
+      ["Тег", player.tag || "—"],
+      ["ТХ", player.townHallLevel ? "ТХ " + player.townHallLevel : "—"],
+      ["Лига", (player.league && player.league.name) || "—"],
+      ["Клан", (player.clan && player.clan.name) || "Без клана"],
+    ];
+    meCard.innerHTML = rows
       .map(
         ([k, v]) => `
         <div class="playerLine">
@@ -221,6 +286,39 @@
     setStatus(statusTag, "info", "Введи тег и нажми «Найти».");
   });
 
+  async function doUnlink() {
+    if (!confirm("Удалить привязку?")) return;
+    try {
+      await api("/api/unlink", { initData });
+      lastPlayer = null;
+      selectedTag = "";
+      renderMeCard(null);
+      show(stepIntro);
+    } catch (e) {
+      alert(e.message || "Не удалось удалить привязку.");
+    }
+  }
+
+  btnUnlink.addEventListener("click", doUnlink);
+
+  btnMenu.addEventListener("click", openDrawer);
+  backdrop.addEventListener("click", closeDrawer);
+  drawerClose.addEventListener("click", closeDrawer);
+  drawerMe.addEventListener("click", () => {
+    closeDrawer();
+    show(stepDone);
+  });
+  drawerChange.addEventListener("click", () => {
+    closeDrawer();
+    show(stepTag);
+    fillTelegramUser();
+    setStatus(statusTag, "info", "Введи тег и нажми «Найти».");
+  });
+  drawerUnlink.addEventListener("click", async () => {
+    closeDrawer();
+    await doUnlink();
+  });
+
   // initial
   try {
     if (tg) initData = tg.initData || "";
@@ -242,7 +340,8 @@
         lastPlayer = p;
         selectedTag = normTag(tag);
         show(stepDone);
-        doneText.innerHTML = `Уже привязано: <b>${escapeHtml(name)}</b> <code>${escapeHtml(selectedTag)}</code>.<br/>Если нужно — можешь изменить привязку.`;
+        doneText.innerHTML = `Сейчас привязано: <b>${escapeHtml(name)}</b> <code>${escapeHtml(selectedTag)}</code>.`;
+        renderMeCard(p);
       }
     } catch (_) {
       // ignore
