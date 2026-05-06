@@ -26,6 +26,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     Message,
+    ReplyKeyboardRemove,
     WebAppInfo,
 )
 from PIL import Image, ImageDraw, ImageFont
@@ -55,6 +56,13 @@ _CLAN_WARLEAGUE_CACHED: str | None = None
 
 OWNER_USER_ID: int = 7053001262
 CHAT_ID: int = -1002552886756
+
+# For groups with Topics enabled (forum supergroups):
+# - If you want bot background messages (broadcasts/announcements) to land in a specific topic,
+#   set the corresponding thread id here.
+# - Replies to user commands are sent to the same topic automatically.
+CHAT_MAIN_THREAD_ID: int = 0
+CHAT_ADMIN_THREAD_ID: int = 0
 
 # Supabase (Postgres) connection string (same settings as bot.py; hardcoded as requested)
 DATABASE_URL: str = "postgresql://postgres.jqiomtvtvtsizubzunhb:My%20happy%20life64@aws-1-eu-north-1.pooler.supabase.com:5432/postgres"
@@ -767,6 +775,51 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _thread_id_from_message(message: Message | None) -> int | None:
+    """
+    Return Telegram forum topic thread id for this message, if any.
+    In forum supergroups, sending without message_thread_id goes to "General".
+    """
+    if not message:
+        return None
+    try:
+        tid = getattr(message, "message_thread_id", None)
+        return int(tid) if tid is not None else None
+    except Exception:
+        return None
+
+
+async def _answer_in_thread(message: Message, text: str, **kwargs):
+    """
+    Answer in the same topic thread (if chat has Topics enabled).
+    """
+    tid = _thread_id_from_message(message)
+    if tid is not None and "message_thread_id" not in kwargs:
+        kwargs["message_thread_id"] = tid
+    return await message.answer(text, **kwargs)
+
+
+async def _clear_legacy_reply_keyboard(message: Message) -> None:
+    """
+    If an old ReplyKeyboard is still shown (from older bot versions), hide it.
+    Inline keyboards don't remove reply keyboards automatically.
+    """
+    try:
+        tid = _thread_id_from_message(message)
+        tmp = await message.bot.send_message(
+            chat_id=message.chat.id,
+            text=" ",
+            reply_markup=ReplyKeyboardRemove(),
+            message_thread_id=tid,
+        )
+        try:
+            await message.bot.delete_message(message.chat.id, tmp.message_id)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def members_pager_keyboard(page: int, total_pages: int, chunk: list[dict]) -> InlineKeyboardMarkup:
     nav_row: list[InlineKeyboardButton] = []
     if page > 1:
@@ -828,7 +881,8 @@ async def _edit_or_send(message: Message, text: str, reply_markup: InlineKeyboar
             disable_web_page_preview=True,
         )
     except Exception:
-        await message.answer(
+        await _answer_in_thread(
+            message,
             text,
             parse_mode="HTML",
             reply_markup=reply_markup,
@@ -2668,6 +2722,24 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
     cwl_scan_cooldown_seconds = 600  # 10 минут
     cwl_next_scan_at: float = 0.0
 
+    # In forum supergroups, background messages must include message_thread_id
+    # to land in the correct topic. Otherwise they go to "General".
+    topic_tid: int | None = None
+    try:
+        if int(chat_id) == int(CHAT_ID) and int(CHAT_MAIN_THREAD_ID or 0) > 0:
+            topic_tid = int(CHAT_MAIN_THREAD_ID)
+    except Exception:
+        topic_tid = None
+
+    async def _send(text: str) -> None:
+        await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            message_thread_id=topic_tid,
+        )
+
     while True:
         try:
             await _refresh_links_cache()
@@ -2784,7 +2856,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                         f"До конца: <b>{_safe(time_left)}</b>\n\n"
                         f"{_format_missing_block(missing_lines)}"
                     )
-                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    await _send(text)
                     sent.add("start")
                     war_sent["start"] = now_ts
                 elif remaining <= 3600 and remaining > 0 and "last_hour" not in sent and _can_send("last_hour", 6 * 3600):
@@ -2794,7 +2866,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                         f"Осталось: <b>{_safe(time_left)}</b>\n\n"
                         f"{_format_missing_block(missing_lines)}"
                     )
-                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    await _send(text)
                     sent.add("last_hour")
                     war_sent["last_hour"] = now_ts
                 elif elapsed >= int(duration * 0.67) and "twothirds" not in sent and remaining > 3600 and _can_send("twothirds", 6 * 3600):
@@ -2804,7 +2876,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                         f"До конца: <b>{_safe(time_left)}</b>\n\n"
                         f"{_format_missing_block(missing_lines)}"
                     )
-                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    await _send(text)
                     sent.add("twothirds")
                     war_sent["twothirds"] = now_ts
                 elif elapsed >= int(duration * 0.33) and "third" not in sent and remaining > 3600 and _can_send("third", 6 * 3600):
@@ -2815,7 +2887,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                         f"Против: <b>{opp_name}</b>\n\n"
                         f"{_format_missing_block(missing_lines)}"
                     )
-                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    await _send(text)
                     sent.add("third")
                     war_sent["third"] = now_ts
 
@@ -2844,7 +2916,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                         f"Итог: <b>{result}</b>\n"
                         f"Счёт: ⭐ <b>{our_stars}</b>:<b>{opp_stars}</b> • 💥 <b>{our_d:.2f}%</b>:<b>{opp_d:.2f}%</b>"
                     )
-                    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                    await _send(text)
                     sent.add("end")
                     if active_id:
                         war_sent["end"] = now_ts
@@ -2872,6 +2944,15 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
     min_repeat_seconds = 900  # 15 minutes (avoid same message too often)
     last_fingerprint: str | None = None
     last_sent_at: float = 0.0
+
+    # For forum supergroups: pin the reminders into the configured main topic (if set),
+    # otherwise they will land in "General".
+    topic_tid: int | None = None
+    try:
+        if int(chat_id) == int(CHAT_ID) and int(CHAT_MAIN_THREAD_ID or 0) > 0:
+            topic_tid = int(CHAT_MAIN_THREAD_ID)
+    except Exception:
+        topic_tid = None
 
     while True:
         try:
@@ -2966,7 +3047,11 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
 
                 if not msg_id:
                     sent = await bot.send_message(
-                        chat_id, text, parse_mode="HTML", disable_web_page_preview=True
+                        chat_id,
+                        text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        message_thread_id=topic_tid,
                     )
                     _notify_message_ids[chat_id] = sent.message_id
 
@@ -3128,6 +3213,7 @@ async def http_api_verify(request: web.Request) -> web.Response:
                 f"✅ {mention} привязал аккаунт: <b>{coc_name}</b> <code>{_safe(tag)}</code>",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
+                message_thread_id=(CHAT_MAIN_THREAD_ID if int(CHAT_MAIN_THREAD_ID or 0) > 0 else None),
             )
     except Exception:
         pass
@@ -3215,6 +3301,7 @@ async def http_api_unlink(request: web.Request) -> web.Response:
                     f"ℹ️ {mention} убрал привязку аккаунта: <b>{coc}</b> <code>{tag}</code>",
                     parse_mode="HTML",
                     disable_web_page_preview=True,
+                    message_thread_id=(CHAT_MAIN_THREAD_ID if int(CHAT_MAIN_THREAD_ID or 0) > 0 else None),
                 )
         except Exception:
             pass
@@ -3269,7 +3356,7 @@ async def _ensure_registered_for_message(message: Message) -> bool:
         uid = 0
     if uid <= 0:
         # Message sent without from_user (e.g. anonymous admin / channel). We can't link it.
-        await message.answer(
+        await _answer_in_thread(
             "⚠️ <b>Не вижу, кто отправил команду</b>\n\n"
             "Скорее всего, сообщение отправлено <b>анонимно</b> (от имени канала/админа).\n"
             "Отправь команду от своего аккаунта — и я сразу пришлю кнопку регистрации.",
@@ -3279,7 +3366,7 @@ async def _ensure_registered_for_message(message: Message) -> bool:
         return False
     if uid and await is_user_registered(uid):
         return True
-    await message.answer(
+    await _answer_in_thread(
         registration_prompt_text(message.from_user),
         parse_mode="HTML",
         reply_markup=registration_keyboard(),
@@ -3979,20 +4066,27 @@ async def cb_cwl_round(query: CallbackQuery) -> None:
     await _edit_or_send(query.message, text, cwl_rounds_keyboard(len(rounds)))
 
 
-@router_dp.message(Command("start"))
+@router_dp.message(Command("start", ignore_mention=True))
 async def handle_start(message: Message) -> None:
     """Главное меню бота."""
     logger.info("User %s triggered /start in chat %s", getattr(message.from_user, "id", "—"), message.chat.id)
+    await _clear_legacy_reply_keyboard(message)
     if not await _ensure_registered_for_message(message):
         return
-    await message.answer(build_home_text(), parse_mode="HTML", reply_markup=menu_keyboard_for(getattr(message.from_user, "id", None), 1))
+    await _answer_in_thread(
+        message,
+        build_home_text(),
+        parse_mode="HTML",
+        reply_markup=menu_keyboard_for(getattr(message.from_user, "id", None), 1),
+    )
     logger.info("User %s triggered /start", getattr(message.from_user, "id", "—"))
 
 
-@router_dp.message(Command("reg"))
+@router_dp.message(Command("reg", ignore_mention=True))
 async def handle_reg(message: Message) -> None:
     """Показать кнопку регистрации (Mini App)."""
     logger.info("User %s triggered /reg in chat %s", getattr(message.from_user, "id", "—"), message.chat.id)
+    await _clear_legacy_reply_keyboard(message)
     try:
         uid = int(message.from_user.id) if message.from_user else 0
     except Exception:
@@ -4007,9 +4101,9 @@ async def handle_reg(message: Message) -> None:
             f"У тебя уже есть привязка: <b>{name}</b> <code>{tag}</code>\n\n"
             "Если нужно — можешь открыть мини‑приложение и изменить привязку."
         )
-        await message.answer(text, parse_mode="HTML", reply_markup=registration_keyboard())
+        await _answer_in_thread(message, text, parse_mode="HTML", reply_markup=registration_keyboard())
         return
-    await message.answer(
+    await _answer_in_thread(
         registration_prompt_text(message.from_user),
         parse_mode="HTML",
         reply_markup=registration_keyboard(),
@@ -4017,7 +4111,7 @@ async def handle_reg(message: Message) -> None:
     )
 
 
-@router_dp.message(Command("json"))
+@router_dp.message(Command("json", ignore_mention=True))
 async def handle_json(message: Message) -> None:
     """Отправить владельцу JSON со всеми регистрациями."""
     if not _is_owner(message):
@@ -4056,7 +4150,7 @@ async def handle_json(message: Message) -> None:
         await message.answer(f"⚠️ Не удалось собрать JSON: {_safe(exc)}", parse_mode="HTML")
 
 
-@router_dp.message(Command("reset"))
+@router_dp.message(Command("reset", ignore_mention=True))
 async def handle_reset(message: Message) -> None:
     """
     Emergency reset for API issues:
@@ -4130,7 +4224,7 @@ async def handle_reset(message: Message) -> None:
         )
 
 
-@router_dp.message(Command("chatid"))
+@router_dp.message(Command("chatid", ignore_mention=True))
 async def handle_chatid(message: Message) -> None:
     """Показать ID текущего чата (для настройки CHAT_ID)."""
     if not _is_owner(message):
@@ -4142,17 +4236,42 @@ async def handle_chatid(message: Message) -> None:
         f"Тип: <b>{_safe(getattr(chat, 'type', '—'))}</b>\n"
         f"ID: <code>{chat.id}</code>"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    await _answer_in_thread(message, text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 
-@router_dp.message(Command("find"))
+@router_dp.message(Command("threadid", ignore_mention=True))
+async def handle_threadid(message: Message) -> None:
+    """Показать ID темы (topic) в группах с Topics, чтобы настроить CHAT_*_THREAD_ID."""
+    if not _is_owner(message):
+        return
+    tid = _thread_id_from_message(message)
+    chat = message.chat
+    if tid is None:
+        text = (
+            "🧵 <b>ID темы</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Сейчас это <b>не тема</b> (Topics выключены или ты в «General» без thread id).\n\n"
+            f"Чат: <code>{chat.id}</code>"
+        )
+    else:
+        text = (
+            "🧵 <b>ID темы</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Чат: <code>{chat.id}</code>\n"
+            f"Тема (message_thread_id): <code>{tid}</code>\n\n"
+            "Подставь это число в <code>CHAT_MAIN_THREAD_ID</code> или <code>CHAT_ADMIN_THREAD_ID</code> в <code>clash.py</code>."
+        )
+    await _answer_in_thread(message, text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+
+@router_dp.message(Command("find", ignore_mention=True))
 async def handle_find(message: Message) -> None:
     """Поиск по участникам клана по нику/тегу."""
     if not await _ensure_registered_for_message(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer(
+        await _answer_in_thread(
             "🔎 <b>Поиск</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "Напиши:\n"
@@ -4168,13 +4287,13 @@ async def handle_find(message: Message) -> None:
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="find members")
     if err:
-        await message.answer(err, parse_mode="HTML", reply_markup=main_menu_keyboard(2))
+        await _answer_in_thread(message, err, parse_mode="HTML", reply_markup=main_menu_keyboard(2))
         return
 
     members: list[dict] = data.get("items", [])
     matches = search_members(members, query)[:20]
     if not matches:
-        await message.answer(
+        await _answer_in_thread(
             "🔎 <b>Поиск</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"Ничего не найдено по запросу: <code>{_safe(query)}</code>",
@@ -4218,10 +4337,10 @@ async def handle_find(message: Message) -> None:
         + "\n".join(lines)
         + "\n\n<i>Нажми цифру, чтобы открыть профиль.</i>"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await _answer_in_thread(message, text, parse_mode="HTML", reply_markup=kb)
 
 
-@router_dp.message(Command("help"))
+@router_dp.message(Command("help", ignore_mention=True))
 async def handle_help(message: Message) -> None:
     """Краткая справка (русский интерфейс)."""
     if not await _ensure_registered_for_message(message):
@@ -4238,7 +4357,7 @@ async def handle_help(message: Message) -> None:
     logger.info("User %s triggered /help", getattr(message.from_user, "id", "—"))
 
 
-@router_dp.message(Command("clan"))
+@router_dp.message(Command("clan", ignore_mention=True))
 async def handle_clan(message: Message) -> None:
     """Показать информацию о клане (по умолчанию — CLAN_TAG)."""
     logger.info("User %s triggered /clan", getattr(message.from_user, "id", "—"))
@@ -4264,7 +4383,7 @@ async def handle_clan(message: Message) -> None:
     await message.answer(build_clan_text(data), parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 
-@router_dp.message(Command("player"))
+@router_dp.message(Command("player", ignore_mention=True))
 async def handle_player(message: Message) -> None:
     """
     Показать информацию об игроке по тегу.
@@ -4307,7 +4426,7 @@ async def handle_player(message: Message) -> None:
     await status.edit_text(build_player_text(data), parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 
-@router_dp.message(Command("war"))
+@router_dp.message(Command("war", ignore_mention=True))
 async def handle_war(message: Message) -> None:
     """Показать текущую войну клана (CLAN_TAG)."""
     logger.info("User %s triggered /war", getattr(message.from_user, "id", "—"))
@@ -4323,7 +4442,7 @@ async def handle_war(message: Message) -> None:
     await message.answer(build_war_text(data), parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 
-@router_dp.message(Command("members"))
+@router_dp.message(Command("members", ignore_mention=True))
 async def handle_members(message: Message) -> None:
     """Показать участников клана (страница 1)."""
     logger.info("User %s triggered /members", getattr(message.from_user, "id", "—"))
@@ -4341,7 +4460,7 @@ async def handle_members(message: Message) -> None:
     await message.answer(text, parse_mode="HTML", reply_markup=members_pager_keyboard(1, total_pages, chunk))
 
 
-@router_dp.message(Command("top"))
+@router_dp.message(Command("top", ignore_mention=True))
 async def handle_top(message: Message) -> None:
     """Топ 10 участников клана по трофеям."""
     logger.info("User %s triggered /top", getattr(message.from_user, "id", "—"))
@@ -4395,7 +4514,7 @@ async def handle_top(message: Message) -> None:
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 
-@router_dp.message(Command("donations"))
+@router_dp.message(Command("donations", ignore_mention=True))
 async def handle_donations(message: Message) -> None:
     """Топ донатеров клана за сезон."""
     logger.info("User %s triggered /donations", getattr(message.from_user, "id", "—"))
