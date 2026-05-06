@@ -7,11 +7,16 @@ import os
 import signal
 import sys
 import time
+import hmac
+import hashlib
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from urllib.parse import quote
 
 import requests
+import asyncpg
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command
@@ -22,6 +27,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     Message,
+    WebAppInfo,
 )
 from PIL import Image, ImageDraw, ImageFont
 
@@ -30,7 +36,7 @@ try:
 except Exception:  
     clashapi = None
 
-TELEGRAM_BOT_TOKEN: str = "8475734533:AAGKGG72h0KyFWfhzvc2BPj-ZtZ9xBOGWUU"
+TELEGRAM_BOT_TOKEN: str = "8527467590:AAErJnjBo4V9i3mGpzLRqqGDcQ1Q6rwrpU8"
 
 # Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
@@ -45,6 +51,25 @@ _CLAN_WARLEAGUE_CACHED: str | None = None
 
 OWNER_USER_ID: int = 7053001262
 CHAT_ID: int = -1002552886756
+
+# Supabase (Postgres) connection string (same settings as bot.py; hardcoded as requested)
+DATABASE_URL: str = "postgresql://postgres.jqiomtvtvtsizubzunhb:My%20happy%20life64@aws-1-eu-north-1.pooler.supabase.com:5432/postgres"
+
+# Public base URL for Telegram Mini App (Render usually sets RENDER_EXTERNAL_URL automatically)
+PUBLIC_BASE_URL: str = (
+    (os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
+    or (os.environ.get("PUBLIC_BASE_URL") or "").strip()
+    or "http://localhost:10000"
+)
+
+# WebApp auth/session settings
+WEBAPP_SESSION_TTL_SECONDS: int = 15 * 60
+
+_pg_pool: asyncpg.Pool | None = None
+_webapp_sessions: dict[str, dict] = {}
+_links_cache: dict[str, int] = {}  # COC_TAG -> telegram_user_id
+_links_cache_loaded_at: float = 0.0
+LINKS_CACHE_TTL_SECONDS: int = 300  # 5 minutes
 
 # Local time formatting for UI (UTC offset). Ashgabat is UTC+5.
 LOCAL_UTC_OFFSET_HOURS: int = 5
@@ -83,6 +108,24 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("coc_bot")
+
+
+def miniapp_url() -> str:
+    base = (PUBLIC_BASE_URL or "").strip().rstrip("/")
+    if not base:
+        base = "http://localhost:10000"
+    return f"{base}/webapp"
+
+
+def miniapp_https_url() -> str | None:
+    """
+    Telegram Web Apps require HTTPS URLs.
+    Returns HTTPS URL for WebApp button or None if unavailable (e.g. local http://).
+    """
+    url = miniapp_url().strip()
+    if url.lower().startswith("https://"):
+        return url
+    return None
 
 # ============================================================
 # SECTION: CLASH TOKEN MANAGER
@@ -626,12 +669,20 @@ def extract_tag_arg(text: str, default_tag: str | None = None) -> str | None:
 
 
 def main_menu_keyboard(page: int = 1) -> InlineKeyboardMarkup:
+    wa_url = miniapp_https_url()
     if page == 2:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(text="🔎 Поиск", callback_data="menu:find"),
                     InlineKeyboardButton(text="🔗 Ссылка клана", callback_data="menu:link"),
+                ],
+                [
+                    (
+                        InlineKeyboardButton(text="✅ Зарегистрироваться", web_app=WebAppInfo(url=wa_url))
+                        if wa_url
+                        else InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")
+                    )
                 ],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:back")],
             ]
@@ -660,6 +711,13 @@ def main_menu_keyboard(page: int = 1) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🏚️ Столица", callback_data="menu:capital"),
             ],
             [InlineKeyboardButton(text="📊 Статистика игрока", callback_data="menu:pstats")],
+            [
+                (
+                    InlineKeyboardButton(text="✅ Зарегистрироваться", web_app=WebAppInfo(url=wa_url))
+                    if wa_url
+                    else InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")
+                )
+            ],
             [InlineKeyboardButton(text="➕ Ещё", callback_data="menu:more")],
         ]
     )
@@ -756,6 +814,144 @@ def _extract_clan_war_league_name(clan_info: dict | None) -> str | None:
         return None
     name = str(wl.get("name") or "").strip()
     return name or None
+
+
+def _mention_html(user_id: int, visible_name: str) -> str:
+    # Telegram supports tg://user?id=... links in HTML parse mode
+    return f'<a href="tg://user?id={int(user_id)}">{_safe(visible_name)}</a>'
+
+
+async def _pg_get_pool() -> asyncpg.Pool:
+    global _pg_pool
+    if _pg_pool is not None:
+        return _pg_pool
+    _pg_pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=10,
+    )
+    return _pg_pool
+
+
+async def _pg_ensure_schema() -> None:
+    pool = await _pg_get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coc_links (
+              telegram_user_id BIGINT PRIMARY KEY,
+              coc_tag TEXT NOT NULL,
+              coc_name TEXT NOT NULL DEFAULT '',
+              tg_username TEXT NOT NULL DEFAULT '',
+              tg_first_name TEXT NOT NULL DEFAULT '',
+              verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS coc_links_coc_tag_uidx
+              ON coc_links (coc_tag);
+            """
+        )
+
+
+async def _db_upsert_link(
+    *,
+    telegram_user_id: int,
+    coc_tag: str,
+    coc_name: str,
+    tg_username: str = "",
+    tg_first_name: str = "",
+) -> None:
+    pool = await _pg_get_pool()
+    coc_tag_n = _norm_tag(coc_tag)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO coc_links (telegram_user_id, coc_tag, coc_name, tg_username, tg_first_name, verified_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+            ON CONFLICT (telegram_user_id) DO UPDATE
+            SET coc_tag = EXCLUDED.coc_tag,
+                coc_name = EXCLUDED.coc_name,
+                tg_username = EXCLUDED.tg_username,
+                tg_first_name = EXCLUDED.tg_first_name,
+                updated_at = NOW();
+            """,
+            int(telegram_user_id),
+            coc_tag_n,
+            str(coc_name or ""),
+            str(tg_username or ""),
+            str(tg_first_name or ""),
+        )
+
+
+async def _refresh_links_cache(force: bool = False) -> None:
+    global _links_cache_loaded_at, _links_cache
+    now = time.time()
+    if not force and (now - _links_cache_loaded_at) < LINKS_CACHE_TTL_SECONDS:
+        return
+    try:
+        pool = await _pg_get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT coc_tag, telegram_user_id FROM coc_links")
+        new_map: dict[str, int] = {}
+        for r in rows:
+            try:
+                new_map[_norm_tag(r["coc_tag"])] = int(r["telegram_user_id"])
+            except Exception:
+                continue
+        _links_cache = new_map
+        _links_cache_loaded_at = now
+    except Exception as exc:
+        logger.warning("Links cache refresh failed: %s", exc)
+
+
+def _maybe_mention_player(name: str, player_tag: str | None) -> str:
+    tag = _norm_tag(player_tag)
+    user_id = _links_cache.get(tag)
+    if user_id:
+        return _mention_html(user_id, name)
+    return f"<b>{_safe(name)}</b>"
+
+
+def _validate_webapp_init_data(init_data: str) -> dict | None:
+    """
+    Validate Telegram WebApp initData and return parsed user dict.
+    Returns None if invalid/expired.
+    """
+    if not init_data or not isinstance(init_data, str):
+        return None
+    try:
+        data = urllib.parse.parse_qs(init_data, strict_parsing=True)
+    except Exception:
+        return None
+    if "hash" not in data:
+        return None
+    recv_hash = (data.get("hash") or [""])[0]
+    pairs = []
+    for k in sorted(data.keys()):
+        if k == "hash":
+            continue
+        v = (data.get(k) or [""])[0]
+        pairs.append(f"{k}={v}")
+    data_check_string = "\n".join(pairs)
+    secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode("utf-8")).digest()
+    calc_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc_hash, recv_hash):
+        return None
+    try:
+        auth_date = int((data.get("auth_date") or ["0"])[0])
+    except Exception:
+        auth_date = 0
+    if auth_date and (time.time() - auth_date) > 24 * 3600:
+        return None
+    user_raw = (data.get("user") or [""])[0]
+    try:
+        user = json.loads(user_raw) if user_raw else None
+    except Exception:
+        user = None
+    if not isinstance(user, dict) or "id" not in user:
+        return None
+    return user
 
 
 def _is_owner(message: Message) -> bool:
@@ -2258,9 +2454,10 @@ def get_war_missing_attacks(war: dict, clan_tag: str) -> tuple[str, list[str], s
             continue
         used = len(m.get("attacks", []) or [])
         if used < attacks_per_member:
-            name = _safe(m.get("name", "—"))
+            raw_name = str(m.get("name", "—") or "—")
             th = m.get("townhallLevel", m.get("townHallLevel", "?"))
-            missing_lines.append(f"<b>{name}</b> (TH{th}) — {used}/{attacks_per_member}")
+            name_html = _maybe_mention_player(raw_name, m.get("tag"))
+            missing_lines.append(f"{name_html} (TH{th}) — {used}/{attacks_per_member}")
 
     return "Война", missing_lines, state, end_time
 
@@ -2327,6 +2524,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
 
     while True:
         try:
+            await _refresh_links_cache()
             now = datetime.now(timezone.utc)
 
             kind = ""
@@ -2509,6 +2707,7 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
 
     while True:
         try:
+            await _refresh_links_cache()
             title = None
             missing: list[str] = []
             state = ""
@@ -2614,42 +2813,168 @@ async def _notify_loop(bot: Bot, chat_id: int) -> None:
             await asyncio.sleep(poll_seconds)
 
 
-async def _render_http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+WEBAPP_DIR = os.path.join(os.path.dirname(__file__), "webapp")
+
+
+def _json_error(message: str, status: int = 400) -> web.Response:
+    return web.json_response({"ok": False, "error": str(message)}, status=status)
+
+
+def _pick_player_public_fields(player: dict) -> dict:
+    league = player.get("league") if isinstance(player.get("league"), dict) else {}
+    clan = player.get("clan") if isinstance(player.get("clan"), dict) else {}
+    return {
+        "name": str(player.get("name") or ""),
+        "tag": str(player.get("tag") or ""),
+        "townHallLevel": player.get("townHallLevel"),
+        "expLevel": player.get("expLevel"),
+        "league": {"name": str(league.get("name") or "")} if league else {"name": ""},
+        "clan": {"name": str(clan.get("name") or ""), "tag": str(clan.get("tag") or "")} if clan else {"name": "", "tag": ""},
+    }
+
+
+async def http_health(_: web.Request) -> web.Response:
+    return web.Response(text="OK", content_type="text/plain")
+
+
+async def http_webapp_index(_: web.Request) -> web.StreamResponse:
+    index_path = os.path.join(WEBAPP_DIR, "index.html")
+    if not os.path.exists(index_path):
+        return web.Response(text="webapp not found", status=404)
+    return web.FileResponse(index_path, headers={"Cache-Control": "no-store"})
+
+
+async def http_api_lookup(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except Exception:
+        return _json_error("Некорректный запрос.", 400)
+
+    init_data = str((payload or {}).get("initData") or "")
+    user = _validate_webapp_init_data(init_data)
+    if not user:
+        return _json_error("Открой это окно через кнопку в боте и попробуй ещё раз.", 403)
+
+    tag = str((payload or {}).get("tag") or "")
+    if not validate_tag(tag):
+        return _json_error("Тег выглядит неверно.", 400)
+    tag = _norm_tag(tag)
+
+    player = await asyncio.to_thread(get_player_info, tag)
+    err = check_api_error(player, context="webapp lookup player")
+    if err:
+        return _json_error("Не получилось найти игрока. Проверь тег и попробуй ещё раз.", 404)
+
+    return web.json_response({"ok": True, "player": _pick_player_public_fields(player or {})})
+
+
+def verify_player_token(player_tag: str, token: str) -> dict | None:
     """
-    Minimal HTTP server for Render health checks.
-    Render web services expect the process to bind to $PORT.
+    POST /players/{playerTag}/verifytoken
+    Returns dict like {"status":"ok"} or {"status":"invalid"}.
     """
     try:
-        await reader.readline()
-        while True:
-            line = await reader.readline()
-            if not line or line in (b"\r\n", b"\n"):
-                break
-        body = b"OK"
-        writer.write(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/plain; charset=utf-8\r\n"
-            b"Content-Length: 2\r\n"
-            b"Connection: close\r\n"
-            b"\r\n"
-            + body
+        get_clash_token()
+        encoded = encode_tag(player_tag)
+        url = f"{COC_API_BASE}/players/{encoded}/verifytoken"
+        headers = {"Authorization": f"Bearer {_clash_token}", "Accept": "application/json"}
+        resp = requests.post(url, headers=headers, json={"token": str(token)}, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code in (400, 404):
+            try:
+                return resp.json()
+            except Exception:
+                return {"status": "invalid"}
+        if resp.status_code == 503:
+            return {"_error": "maintenance"}
+        return {"_error": "http", "status_code": resp.status_code}
+    except Exception as exc:
+        logger.error("verifytoken failed: %s", exc)
+        return None
+
+
+async def http_api_verify(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except Exception:
+        return _json_error("Некорректный запрос.", 400)
+
+    init_data = str((payload or {}).get("initData") or "")
+    user = _validate_webapp_init_data(init_data)
+    if not user:
+        return _json_error("Открой это окно через кнопку в боте и попробуй ещё раз.", 403)
+
+    tag = str((payload or {}).get("tag") or "")
+    token = str((payload or {}).get("token") or "").strip()
+    if not validate_tag(tag):
+        return _json_error("Тег выглядит неверно.", 400)
+    if len(token) < 6:
+        return _json_error("Токен выглядит неверно.", 400)
+
+    tag = _norm_tag(tag)
+
+    res = await asyncio.to_thread(verify_player_token, tag, token)
+    if res is None:
+        return _json_error("Не удалось проверить токен. Попробуй ещё раз.", 502)
+    if isinstance(res, dict) and res.get("_error") == "maintenance":
+        return _json_error("Сейчас сервис недоступен. Попробуй чуть позже.", 503)
+
+    status = str((res or {}).get("status") or "").lower()
+    if status != "ok":
+        return _json_error("Неверный токен или срок истёк.", 400)
+
+    player = await asyncio.to_thread(get_player_info, tag)
+    err = check_api_error(player, context="webapp verify player")
+    if err:
+        return _json_error("Проверка прошла, но данные игрока сейчас недоступны. Попробуй ещё раз.", 502)
+
+    try:
+        await _pg_ensure_schema()
+        await _db_upsert_link(
+            telegram_user_id=int(user.get("id")),
+            coc_tag=tag,
+            coc_name=str((player or {}).get("name") or ""),
+            tg_username=str(user.get("username") or ""),
+            tg_first_name=str(user.get("first_name") or ""),
         )
-        await writer.drain()
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
+        # Update cache immediately for mentions
+        _links_cache[_norm_tag(tag)] = int(user.get("id"))
+    except Exception as exc:
+        logger.error("DB upsert failed: %s", exc)
+        return _json_error("Не удалось сохранить привязку. Попробуй ещё раз.", 502)
+
+    return web.json_response({"ok": True, "player": _pick_player_public_fields(player or {})})
 
 
-async def start_render_server() -> asyncio.AbstractServer:
+async def start_render_server() -> web.AppRunner:
+    """
+    Render web services expect the process to bind to $PORT.
+    We serve both:
+      - health check
+      - Telegram Mini App (static)
+      - API endpoints for verification
+    """
+    app = web.Application(client_max_size=2 * 1024 * 1024)
+    app.router.add_get("/", http_health)
+    app.router.add_get("/health", http_health)
+    app.router.add_get("/webapp", http_webapp_index)
+    app.router.add_get("/webapp/", http_webapp_index)
+    if os.path.isdir(WEBAPP_DIR):
+        app.router.add_static("/webapp/", WEBAPP_DIR, show_index=False)
+    app.router.add_post("/api/lookup", http_api_lookup)
+    app.router.add_post("/api/verify", http_api_verify)
+
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
     port_s = os.environ.get("PORT", "10000")
     try:
         port = int(port_s)
     except ValueError:
         port = 10000
-    return await asyncio.start_server(_render_http_handler, host="0.0.0.0", port=port)
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    return runner
 
 
 router_dp = Dispatcher()
@@ -2676,6 +3001,18 @@ async def cb_more(query: CallbackQuery) -> None:
 async def cb_back(query: CallbackQuery) -> None:
     await query.answer()
     await _edit_or_send(query.message, build_home_text(), main_menu_keyboard(1))
+
+
+@router_dp.callback_query(F.data == "menu:webapp")
+async def cb_webapp_info(query: CallbackQuery) -> None:
+    await query.answer()
+    text = (
+        "✅ <b>Регистрация</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Мини‑приложение открывается только по <b>HTTPS</b>.\n\n"
+        "Если ты запускаешь бота локально — разверни его на Render (или используй HTTPS‑туннель) и открой кнопку снова."
+    )
+    await _edit_or_send(query.message, text, main_menu_keyboard())
 
 
 @router_dp.callback_query(F.data == "menu:clan")
@@ -3739,8 +4076,27 @@ async def main() -> None:
     except Exception:
         pass
 
-    # Render health-check server (binds to $PORT). Safe to run locally too.
-    server = await start_render_server()
+    # Render web server (binds to $PORT): health-check + Telegram Mini App.
+    server_runner = await start_render_server()
+
+    # Show public URL in logs (useful to paste into BotFather / UI)
+    try:
+        public_url = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+        if not public_url:
+            public_url = (PUBLIC_BASE_URL or "").strip().rstrip("/")
+        logger.info("Web URL: %s", public_url or "—")
+        if public_url:
+            logger.info("Mini App URL: %s/webapp", public_url)
+    except Exception:
+        pass
+
+    # Prepare DB for Mini App links (Supabase)
+    try:
+        await _pg_ensure_schema()
+        await _refresh_links_cache(force=True)
+        logger.info("Supabase: connected")
+    except Exception as exc:
+        logger.warning("Supabase: not connected (%s)", exc)
 
     # Initialize bot and dispatcher
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -3750,8 +4106,15 @@ async def main() -> None:
     try:
         if isinstance(CHAT_ID, int) and CHAT_ID != 0:
             if CHAT_ID not in _broadcast_tasks or _broadcast_tasks[CHAT_ID].done():
-                _broadcast_tasks[CHAT_ID] = asyncio.create_task(_broadcast_milestones_loop(bot, CHAT_ID))
-                logger.info("Auto broadcast notifications enabled for chat %s", CHAT_ID)
+                # Verify that bot can access the chat (avoid noisy "chat not found" loops)
+                try:
+                    await bot.get_chat(CHAT_ID)
+                    _broadcast_tasks[CHAT_ID] = asyncio.create_task(
+                        _broadcast_milestones_loop(bot, CHAT_ID)
+                    )
+                    logger.info("Auto broadcast notifications enabled for chat %s", CHAT_ID)
+                except Exception as exc:
+                    logger.warning("Auto broadcast disabled: cannot access chat %s (%s)", CHAT_ID, exc)
     except Exception:
         pass
 
@@ -3808,8 +4171,10 @@ async def main() -> None:
                 pass
         _broadcast_tasks.clear()
 
-        server.close()
-        await server.wait_closed()
+        try:
+            await server_runner.cleanup()
+        except Exception:
+            pass
         await bot.session.close()
         logger.info("Bot session closed.")
 
