@@ -5,8 +5,8 @@
       tg.ready();
       tg.expand();
       tg.enableClosingConfirmation();
-      if (tg.setHeaderColor) tg.setHeaderColor("#0b0f14");
-      if (tg.setBackgroundColor) tg.setBackgroundColor("#0b0f14");
+      if (tg.setHeaderColor) tg.setHeaderColor("#0f1115");
+      if (tg.setBackgroundColor) tg.setBackgroundColor("#0f1115");
     }
   } catch (_) {}
 
@@ -32,6 +32,7 @@
   const btnNo = $("btn-no");
   const btnVerify = $("btn-verify");
   const btnClose = $("btn-close");
+  const btnChange = $("btn-change");
 
   let initData = "";
   let selectedTag = "";
@@ -70,6 +71,9 @@
   }
 
   async function api(path, payload) {
+    try {
+      if (!initData && tg) initData = tg.initData || "";
+    } catch (_) {}
     const res = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -115,13 +119,13 @@
   function fillTelegramUser() {
     if (!tg) {
       tgUserLine.textContent =
-        "Открой это окно через кнопку в боте, чтобы мы увидели твой Telegram-профиль.";
+        "Открой это окно через кнопку в боте — так я пойму, кто ты в Telegram.";
       return;
     }
     const u = (tg.initDataUnsafe && tg.initDataUnsafe.user) || null;
     if (!u) {
       tgUserLine.textContent =
-        "Не удалось получить профиль Telegram. Закрой окно и открой снова через бота.";
+        "Не получилось получить профиль Telegram. Закрой окно и открой снова через бота.";
       return;
     }
     const uname = u.username ? "@" + u.username : "без username";
@@ -133,7 +137,7 @@
     fillTelegramUser();
     setStatus(statusTag, "info", "Введи тег и нажми «Найти».");
     try {
-      if (tg) initData = tg.initData || "";
+      if (tg) initData = tg.initData || initData || "";
     } catch (_) {}
   });
 
@@ -159,7 +163,7 @@
     lastPlayer = null;
     selectedTag = "";
     show(stepTag);
-    setStatus(statusTag, "info", "Ок. Введи другой тег.");
+    setStatus(statusTag, "info", "Ок, введи другой тег.");
   });
 
   btnYes.addEventListener("click", () => {
@@ -169,16 +173,16 @@
     }
     show(stepToken);
     tokenInput.value = "";
-    setStatus(statusToken, "info", "Введи токен из игры и нажми «Подтвердить».");
+    setStatus(statusToken, "info", "Введи токен и нажми «Подтвердить».");
   });
 
   btnVerify.addEventListener("click", async () => {
     const token = (tokenInput.value || "").trim();
     if (token.length < 6) {
-      setStatus(statusToken, "bad", "Токен выглядит слишком коротким.");
+      setStatus(statusToken, "bad", "Токен слишком короткий.");
       return;
     }
-    setStatus(statusToken, "info", "Проверяю токен…");
+    setStatus(statusToken, "info", "Проверяю…");
     try {
       const data = await api("/api/verify", { initData, tag: selectedTag, token });
       setStatus(statusToken, "ok", "Готово.");
@@ -194,7 +198,7 @@
         statusToken,
         "bad",
         msg.includes("истек")
-          ? "Похоже, срок токена истёк. Нажми в игре «Авторизационный токен» ещё раз и введи новый."
+          ? "Похоже, токен уже истёк. Нажми в игре «Авторизационный токен» ещё раз и введи новый."
           : msg
       );
       try {
@@ -211,7 +215,39 @@
     window.close();
   });
 
-  // initial
-  setStatus(statusTag, "info", "Нажми «Далее», чтобы начать.");
-})();
+  btnChange.addEventListener("click", () => {
+    show(stepTag);
+    fillTelegramUser();
+    setStatus(statusTag, "info", "Введи тег и нажми «Найти».");
+  });
 
+  // initial
+  try {
+    if (tg) initData = tg.initData || "";
+  } catch (_) {}
+
+  async function boot() {
+    setStatus(statusTag, "info", "Нажми «Далее», чтобы начать.");
+    if (!tg) return;
+    try {
+      initData = tg.initData || initData || "";
+    } catch (_) {}
+    if (!initData) return;
+    try {
+      const data = await api("/api/me", { initData });
+      if (data && data.linked && data.player) {
+        const p = data.player;
+        const name = p.name || "игрок";
+        const tag = p.tag || "";
+        lastPlayer = p;
+        selectedTag = normTag(tag);
+        show(stepDone);
+        doneText.innerHTML = `Уже привязано: <b>${escapeHtml(name)}</b> <code>${escapeHtml(selectedTag)}</code>.<br/>Если нужно — можешь изменить привязку.`;
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  boot();
+})();
