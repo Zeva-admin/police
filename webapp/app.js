@@ -5,8 +5,8 @@
       tg.ready();
       tg.expand();
       tg.enableClosingConfirmation();
-      if (tg.setHeaderColor) tg.setHeaderColor("#0f1115");
-      if (tg.setBackgroundColor) tg.setBackgroundColor("#0f1115");
+      if (tg.setHeaderColor) tg.setHeaderColor("#0b0f14");
+      if (tg.setBackgroundColor) tg.setBackgroundColor("#0b0f14");
     }
   } catch (_) {}
 
@@ -44,6 +44,9 @@
   const drawerClose = $("drawer-close");
 
   const meCard = $("me-card");
+  const loading = $("loading");
+  const loadingTitle = $("loading-title");
+  const loadingText = $("loading-text");
 
   let initData = "";
   let selectedTag = "";
@@ -60,10 +63,23 @@
   function openDrawer() {
     drawer.classList.remove("hidden");
     backdrop.classList.remove("hidden");
+    drawer.setAttribute("aria-hidden", "false");
   }
   function closeDrawer() {
     drawer.classList.add("hidden");
     backdrop.classList.add("hidden");
+    drawer.setAttribute("aria-hidden", "true");
+  }
+
+  function setLoading(on, title, text) {
+    if (!loading) return;
+    if (on) {
+      if (loadingTitle) loadingTitle.textContent = title || "Загружаю…";
+      if (loadingText) loadingText.textContent = text || "Секунду.";
+      loading.classList.remove("hidden");
+    } else {
+      loading.classList.add("hidden");
+    }
   }
 
   function normTag(raw) {
@@ -115,17 +131,33 @@
     try {
       if (!initData && tg) initData = tg.initData || "";
     } catch (_) {}
-    const res = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload || {}),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data || data.ok === false) {
-      const msg = (data && data.error) || "Не удалось выполнить запрос.";
-      throw new Error(msg);
+    // Small UI hint: show overlay for network calls (prevents "nothing happens" feeling)
+    const label =
+      path === "/api/lookup"
+        ? "Ищу игрока…"
+        : path === "/api/verify"
+          ? "Проверяю токен…"
+          : path === "/api/me"
+            ? "Проверяю привязку…"
+            : path === "/api/unlink"
+              ? "Удаляю привязку…"
+              : "Загружаю…";
+    setLoading(true, label, "Пара секунд.");
+    try {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload || {}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data || data.ok === false) {
+        const msg = (data && data.error) || "Не удалось выполнить запрос.";
+        throw new Error(msg);
+      }
+      return data;
+    } finally {
+      setLoading(false);
     }
-    return data;
   }
 
   function renderPlayerCard(player) {
@@ -209,7 +241,7 @@
   btnLookup.addEventListener("click", async () => {
     const tag = normTag(tagInput.value);
     if (!tagLooksValid(tag)) {
-      setStatus(statusTag, "bad", "Похоже, тег введён неверно.");
+      setStatus(statusTag, "bad", "Тег выглядит странно. Проверь и попробуй ещё раз.");
       return;
     }
     setStatus(statusTag, "info", "Ищу игрока…");
@@ -252,8 +284,11 @@
       const data = await api("/api/verify", { initData, tag: selectedTag, token });
       setStatus(statusToken, "ok", "Готово.");
       show(stepDone);
-      const name = (data && data.player && data.player.name) || (lastPlayer && lastPlayer.name) || "игрок";
-      doneText.innerHTML = `Привязка выполнена: <b>${escapeHtml(name)}</b> <code>${escapeHtml(selectedTag)}</code>.<br/>Теперь можешь закрыть окно и пользоваться ботом.`;
+      const player = (data && data.player) || lastPlayer || null;
+      const name = (player && player.name) || "игрок";
+      lastPlayer = player;
+      renderMeCard(player);
+      doneText.innerHTML = `Готово: <b>${escapeHtml(name)}</b> <code>${escapeHtml(selectedTag)}</code>.<br/>Можно закрывать окно — бот уже запомнил привязку.`;
       try {
         if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
       } catch (_) {}
@@ -325,7 +360,7 @@
   } catch (_) {}
 
   async function boot() {
-    setStatus(statusTag, "info", "Нажми «Далее», чтобы начать.");
+    setStatus(statusTag, "info", "Нажми «Начать», чтобы привязать аккаунт.");
     if (!tg) return;
     try {
       initData = tg.initData || initData || "";
