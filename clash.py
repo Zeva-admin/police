@@ -52,7 +52,6 @@ TELEGRAM_BOT_TOKEN: str = (
     or ""
 ).strip()
 
-# Clash of Clans API credentials (hardcoded as required)
 CLASH_EMAIL: str = "imprayimpray4@gmail.com"
 CLASH_PASSWORD: str = "My happy life43"
 
