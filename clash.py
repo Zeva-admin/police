@@ -49,7 +49,7 @@ except Exception:
 _TELEGRAM_BOT_TOKEN_ENV = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_BOT_TOKEN: str = (
     _TELEGRAM_BOT_TOKEN_ENV
-    or "8624486117:AAEIBVkKi7s8rZz79EPV7U5i7HL9DJRlFYE"
+    or ""
 ).strip()
 
 # Clash of Clans API credentials (hardcoded as required)
