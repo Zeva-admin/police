@@ -10,7 +10,9 @@
 <body>
 <main class="app" id="app">
 
-  <!-- шапка -->
+  <!-- ══════════════════════════════════════════
+       ШАПКА
+  ══════════════════════════════════════════ -->
   <header class="header">
     <div class="topbar">
       <div class="brand">
@@ -21,57 +23,76 @@
         <div class="brandTitle">Привяжи аккаунт</div>
       </div>
       <button class="iconBtn" id="btn-menu" aria-label="Меню">
-        <svg class="iconSvg" viewBox="0 0 24 24">
-          <rect x="4" y="7" width="16" height="1.6" rx=".8" fill="currentColor"/>
-          <rect x="4" y="11.2" width="16" height="1.6" rx=".8" fill="currentColor"/>
-          <rect x="4" y="15.4" width="16" height="1.6" rx=".8" fill="currentColor"/>
+        <svg class="iconSvg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <line x1="4" y1="7"  x2="20" y2="7"/>
+          <line x1="4" y1="12" x2="20" y2="12"/>
+          <line x1="4" y1="17" x2="20" y2="17"/>
         </svg>
       </button>
     </div>
-    <p style="margin-top:10px;font-size:13.5px;color:var(--muted)">
+    <p style="margin-top:12px;font-size:13px;color:var(--text-3);font-family:var(--mono);letter-spacing:0.02em;">
       Привяжи аккаунт — бот будет знать, кто ты в клане.
     </p>
   </header>
 
-  <!-- сайдбар -->
+  <!-- ══════════════════════════════════════════
+       САЙДБАР
+  ══════════════════════════════════════════ -->
   <aside class="sidebar hidden" id="drawer" aria-hidden="true">
     <div class="sidebarPanel" role="dialog" aria-modal="true" aria-label="Меню">
+
       <div class="sidebarHeader">
         <div class="sidebarTitle">Меню</div>
         <button class="iconBtn small" id="drawer-close" aria-label="Закрыть">
-          <svg class="iconSvg" viewBox="0 0 24 24">
-            <path d="M5 5l14 14M19 5 5 19" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+          <svg class="iconSvg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M5 5l14 14M19 5 5 19"/>
           </svg>
         </button>
       </div>
+
       <nav class="sidebarBody">
         <button class="navBtn" id="drawer-me">
           <span class="navIcon">
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <svg viewBox="0 0 24 24">
+              <circle cx="12" cy="8" r="4"/>
+              <path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>
+            </svg>
           </span>
           Текущая привязка
         </button>
+
         <button class="navBtn" id="drawer-change">
           <span class="navIcon">
-            <svg viewBox="0 0 24 24"><path d="M4 12h16M15 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <svg viewBox="0 0 24 24">
+              <path d="M4 12h16M15 6l6 6-6 6"/>
+            </svg>
           </span>
           Сменить аккаунт
         </button>
+
         <button class="navBtn danger" id="drawer-unlink">
           <span class="navIcon">
-            <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M19 6l-1 14H6L5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 11v6M14 11v6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <svg viewBox="0 0 24 24">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6l-1 14H6L5 6"/>
+              <path d="M10 11v6M14 11v6"/>
+            </svg>
           </span>
           Удалить привязку
         </button>
       </nav>
+
       <div class="sidebarFooter">
         Токен живёт пару минут. Если не успел — просто запроси новый в игре.
       </div>
     </div>
   </aside>
+
   <div class="backdrop hidden" id="backdrop"></div>
 
-  <!-- лоадер -->
+  <!-- ══════════════════════════════════════════
+       ЛОАДЕР
+  ══════════════════════════════════════════ -->
   <div class="loading hidden" id="loading" aria-live="polite" aria-busy="true">
     <div class="loadingCard">
       <div class="loadingIcon">
@@ -86,67 +107,77 @@
     </div>
   </div>
 
-  <!-- шаг 1 — вводная -->
+  <!-- ══════════════════════════════════════════
+       ШАГ 1 — ВВОДНАЯ
+  ══════════════════════════════════════════ -->
   <section class="card" id="step-intro">
 
-    <!-- живая SVG-иллюстрация: цепочка шагов -->
-    <svg class="intro-svg" viewBox="0 0 320 90" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <!-- SVG иллюстрация — цепочка шагов -->
+    <svg class="intro-svg" viewBox="0 0 300 72" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
 
-      <!-- трек-линия -->
-      <line x1="60" y1="45" x2="260" y2="45" stroke="rgba(255,255,255,.08)" stroke-width="1.5"/>
+      <!-- трек -->
+      <line x1="46" y1="32" x2="254" y2="32" stroke="rgba(255,255,255,0.06)" stroke-width="1.5"/>
 
-      <!-- заполнение трека (анимация) -->
-      <line x1="60" y1="45" x2="260" y2="45"
-            stroke="var(--blue)" stroke-width="1.5" stroke-opacity=".35"
-            stroke-dasharray="200" stroke-dashoffset="200">
-        <animate attributeName="stroke-dashoffset" values="200;0" dur="1.6s" begin=".4s" fill="freeze" calcMode="spline" keySplines="0.4 0 0.2 1"/>
+      <!-- заполнение (анимация) -->
+      <line x1="46" y1="32" x2="254" y2="32"
+            stroke="#00d4ff" stroke-width="1.5" stroke-opacity="0.3"
+            stroke-dasharray="208" stroke-dashoffset="208">
+        <animate attributeName="stroke-dashoffset" values="208;0" dur="1.8s" begin="0.3s" fill="freeze" calcMode="spline" keySplines="0.4 0 0.2 1"/>
       </line>
 
-      <!-- шаг 1: тег -->
-      <circle cx="60" cy="45" r="20" stroke="var(--blue)" stroke-width="1.2" fill="rgba(74,128,232,.08)"/>
-      <text x="60" y="41" text-anchor="middle" fill="var(--muted)" font-size="8" font-family="IBM Plex Sans,sans-serif" font-weight="500">ШАГ</text>
-      <text x="60" y="55" text-anchor="middle" fill="var(--blue)" font-size="14" font-family="IBM Plex Sans,sans-serif" font-weight="700">1</text>
-
-      <!-- шаг 2: токен -->
-      <circle cx="160" cy="45" r="20" stroke="rgba(255,255,255,.1)" stroke-width="1.2" fill="rgba(255,255,255,.02)">
-        <animate attributeName="stroke" values="rgba(255,255,255,.1);var(--blue);rgba(255,255,255,.1)" dur="2.4s" begin=".8s" repeatCount="indefinite"/>
+      <!-- ШАГ 1 -->
+      <circle cx="46" cy="32" r="20" fill="rgba(0,212,255,0.08)" stroke="#00d4ff" stroke-width="1"/>
+      <circle cx="46" cy="32" r="20" fill="none" stroke="#00d4ff" stroke-width="1" stroke-opacity="0.5">
+        <animate attributeName="r" values="20;24;20" dur="3s" repeatCount="indefinite"/>
+        <animate attributeName="stroke-opacity" values="0.5;0;0.5" dur="3s" repeatCount="indefinite"/>
       </circle>
-      <text x="160" y="41" text-anchor="middle" fill="var(--muted)" font-size="8" font-family="IBM Plex Sans,sans-serif" font-weight="500">ШАГ</text>
-      <text x="160" y="55" text-anchor="middle" fill="var(--muted)" font-size="14" font-family="IBM Plex Sans,sans-serif" font-weight="700">
+      <text x="46" y="28" text-anchor="middle" fill="rgba(0,212,255,0.5)" font-size="7" font-family="Space Mono,monospace" font-weight="700" letter-spacing="1">ШАГ</text>
+      <text x="46" y="40" text-anchor="middle" fill="#00d4ff" font-size="13" font-family="Space Mono,monospace" font-weight="700">1</text>
+
+      <!-- ШАГ 2 -->
+      <circle cx="150" cy="32" r="20" fill="rgba(255,255,255,0.02)" stroke="rgba(255,255,255,0.1)" stroke-width="1">
+        <animate attributeName="stroke" values="rgba(255,255,255,0.08);rgba(0,212,255,0.4);rgba(255,255,255,0.08)" dur="2.4s" begin="0.6s" repeatCount="indefinite"/>
+      </circle>
+      <text x="150" y="28" text-anchor="middle" fill="rgba(255,255,255,0.2)" font-size="7" font-family="Space Mono,monospace" font-weight="700" letter-spacing="1">ШАГ</text>
+      <text x="150" y="40" text-anchor="middle" fill="rgba(255,255,255,0.2)" font-size="13" font-family="Space Mono,monospace" font-weight="700">
         2
-        <animate attributeName="fill" values="var(--muted);var(--blue);var(--muted)" dur="2.4s" begin=".8s" repeatCount="indefinite"/>
+        <animate attributeName="fill" values="rgba(255,255,255,0.2);rgba(0,212,255,0.7);rgba(255,255,255,0.2)" dur="2.4s" begin="0.6s" repeatCount="indefinite"/>
       </text>
 
-      <!-- шаг 3: готово — галочка -->
-      <circle cx="260" cy="45" r="20" stroke="rgba(58,158,111,.4)" stroke-width="1.2" fill="rgba(58,158,111,.06)"/>
-      <path d="M251 45.5l5.5 5.5 12-13"
-            stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+      <!-- ШАГ 3 — галочка -->
+      <circle cx="254" cy="32" r="20" fill="rgba(0,229,160,0.06)" stroke="rgba(0,229,160,0.3)" stroke-width="1"/>
+      <path d="M245 33l6 6 13-14"
+            stroke="#00e5a0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
             stroke-dasharray="26" stroke-dashoffset="26">
-        <animate attributeName="stroke-dashoffset" values="26;0" dur=".5s" begin="1.8s" fill="freeze" calcMode="spline" keySplines="0.4 0 0.2 1"/>
+        <animate attributeName="stroke-dashoffset" values="26;0" dur="0.45s" begin="1.7s" fill="freeze" calcMode="spline" keySplines="0.4 0 0.2 1"/>
       </path>
 
       <!-- подписи -->
-      <text x="60"  y="75" text-anchor="middle" fill="var(--muted)" font-size="9" font-family="IBM Plex Sans,sans-serif">Тег</text>
-      <text x="160" y="75" text-anchor="middle" fill="var(--muted)" font-size="9" font-family="IBM Plex Sans,sans-serif">Токен</text>
-      <text x="260" y="75" text-anchor="middle" fill="var(--green)" font-size="9" font-family="IBM Plex Sans,sans-serif">Готово</text>
+      <text x="46"  y="62" text-anchor="middle" fill="rgba(0,212,255,0.5)" font-size="9" font-family="Space Mono,monospace">Тег</text>
+      <text x="150" y="62" text-anchor="middle" fill="rgba(255,255,255,0.2)" font-size="9" font-family="Space Mono,monospace">Токен</text>
+      <text x="254" y="62" text-anchor="middle" fill="rgba(0,229,160,0.6)" font-size="9" font-family="Space Mono,monospace">Готово</text>
     </svg>
 
-    <h2>Всё займёт пару минут</h2>
-    <p style="color:var(--muted);font-size:14px;margin-top:4px;">
-      Сначала ищем твой аккаунт по тегу, потом подтверждаем его токеном из игры.
+    <h2>Займёт пару минут</h2>
+    <p style="color:var(--text-2);font-size:13px;margin-top:6px;line-height:1.65;">
+      Ищем аккаунт по тегу, потом подтверждаем его токеном из игры.
     </p>
 
-    <div class="info-box" style="margin-top:16px;">
+    <div class="info-box" style="margin-top:18px;">
       <b>Токен не даёт никакого доступа к аккаунту.</b> Он только подтверждает, что деревня твоя. Действует несколько минут.
     </div>
 
     <div class="row">
       <button class="btn primary full" id="btn-start">Начать</button>
     </div>
+
   </section>
 
-  <!-- шаг: ввод тега -->
+  <!-- ══════════════════════════════════════════
+       ШАГ — ВВОД ТЕГА
+  ══════════════════════════════════════════ -->
   <section class="card hidden" id="step-tag">
+
     <div class="steps">
       <div class="step-item active">
         <div class="step-num">1</div>
@@ -165,19 +196,23 @@
     </div>
 
     <h2>Тег деревни</h2>
-    <p class="tiny" id="tg-user-line" style="color:var(--muted);margin-bottom:2px;"></p>
+    <p class="tiny" id="tg-user-line" style="color:var(--text-3);margin-top:2px;"></p>
 
-    <label class="field-label" for="tag-input">Тег</label>
+    <label class="field-label" for="tag-input">Тег игрока</label>
     <div class="input-row">
       <input id="tag-input" class="input" inputmode="text" autocomplete="off" placeholder="#QV8CUPJ92"/>
       <button class="btn primary" id="btn-lookup">Найти</button>
     </div>
     <p class="hint">Можно с решёткой или без. Пример: <code>QV8CUPJ92</code></p>
     <div class="status" id="status-tag"></div>
+
   </section>
 
-  <!-- шаг: подтверждение игрока -->
+  <!-- ══════════════════════════════════════════
+       ШАГ — ПОДТВЕРЖДЕНИЕ ИГРОКА
+  ══════════════════════════════════════════ -->
   <section class="card hidden" id="step-confirm">
+
     <div class="steps">
       <div class="step-item done">
         <div class="step-num">1</div>
@@ -196,15 +231,19 @@
     </div>
 
     <h2>Это твой аккаунт?</h2>
-    <div id="player-card" style="margin-top:10px;"></div>
+    <div id="player-card"></div>
     <div class="row">
       <button class="btn primary" id="btn-yes">Да, это я</button>
       <button class="btn secondary" id="btn-no">Другой тег</button>
     </div>
+
   </section>
 
-  <!-- шаг: токен -->
+  <!-- ══════════════════════════════════════════
+       ШАГ — ТОКЕН
+  ══════════════════════════════════════════ -->
   <section class="card hidden" id="step-token">
+
     <div class="steps">
       <div class="step-item done">
         <div class="step-num">1</div>
@@ -236,14 +275,18 @@
       <button class="btn primary" id="btn-verify">Проверить</button>
     </div>
     <div class="status" id="status-token"></div>
+
   </section>
 
-  <!-- шаг: готово -->
+  <!-- ══════════════════════════════════════════
+       ШАГ — ГОТОВО
+  ══════════════════════════════════════════ -->
   <section class="card hidden" id="step-done">
+
     <div class="done-header">
       <div class="done-title">
         <h2>Готово</h2>
-        <div class="tiny" style="margin-top:3px;">Аккаунт привязан</div>
+        <div class="tiny">Аккаунт привязан</div>
       </div>
       <div class="success-mark" aria-hidden="true">
         <svg width="28" height="28" viewBox="0 0 28 28">
@@ -252,7 +295,7 @@
       </div>
     </div>
 
-    <p id="done-text" style="font-size:13.5px;color:var(--muted);"></p>
+    <p id="done-text" style="font-size:13px;color:var(--text-2);line-height:1.65;"></p>
 
     <div class="dashboard">
       <div class="dash-card">
@@ -271,6 +314,7 @@
     <div class="row">
       <button class="btn primary full" id="btn-close">Закрыть</button>
     </div>
+
   </section>
 
   <footer class="footer">
