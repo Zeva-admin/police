@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Clash Bot</title>
+  <link rel="stylesheet" href="./style.css"/>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<div class="shell" id="app">
+
+  <!-- ═══ SIDEBAR ═══ -->
+  <aside class="sidebar" id="drawer" aria-hidden="true">
+    <div class="sidebar__overlay" id="backdrop"></div>
+    <div class="sidebar__panel" role="dialog" aria-modal="true" aria-label="Меню">
+
+      <div class="sidebar__head">
+        <div class="sidebar__brand">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+          </svg>
+          Clash Bot
+        </div>
+        <button type="button" class="icon-btn" id="drawer-close" aria-label="Закрыть">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <path d="M5 5l14 14M19 5 5 19"/>
+          </svg>
+        </button>
+      </div>
+
+      <nav class="sidebar__nav">
+        <button type="button" class="nav-item" id="drawer-me">
+          <div class="nav-item__icon">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>
+            </svg>
+          </div>
+          <div class="nav-item__body">
+            <div class="nav-item__title">Моя привязка</div>
+            <div class="nav-item__sub">Текущий аккаунт</div>
+          </div>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" class="nav-item__arrow">
+            <path d="M9 18l6-6-6-6"/>
+          </svg>
+        </button>
+
+        <button type="button" class="nav-item" id="drawer-change">
+          <div class="nav-item__icon">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 12h16M15 6l6 6-6 6"/>
+            </svg>
+          </div>
+          <div class="nav-item__body">
+            <div class="nav-item__title">Сменить аккаунт</div>
+            <div class="nav-item__sub">Другой тег</div>
+          </div>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" class="nav-item__arrow">
+            <path d="M9 18l6-6-6-6"/>
+          </svg>
+        </button>
+
+        <div class="nav-sep"></div>
+
+        <button type="button" class="nav-item nav-item--danger" id="drawer-unlink">
+          <div class="nav-item__icon">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/>
+            </svg>
+          </div>
+          <div class="nav-item__body">
+            <div class="nav-item__title">Удалить привязку</div>
+            <div class="nav-item__sub">Отвязать от бота</div>
+          </div>
+        </button>
+      </nav>
+
+      <div class="sidebar__foot">
+        Токен действует несколько минут.<br/>Не успел — запроси новый в игре.
+      </div>
+    </div>
+  </aside>
+
+  <!-- ═══ LOADER ═══ -->
+  <div class="loader-screen hidden" id="loading" aria-live="polite">
+    <div class="loader-card">
+      <div class="loader-ring">
+        <svg width="36" height="36" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="14" fill="none" stroke="#e4e4e7" stroke-width="2.5"/>
+          <circle cx="18" cy="18" r="14" fill="none" stroke="#09090b" stroke-width="2.5"
+            stroke-dasharray="88" stroke-dashoffset="66" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div>
+        <div class="loader-title" id="loading-title">Загружаю</div>
+        <div class="loader-sub" id="loading-text">Секунду</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ TOPBAR ═══ -->
+  <header class="topbar">
+    <div class="topbar__brand">
+      <div class="topbar__mark">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+        </svg>
+      </div>
+      <div>
+        <div class="topbar__name">Clash Bot</div>
+        <div class="topbar__sub">Привязка аккаунта</div>
+      </div>
+    </div>
+    <button type="button" class="icon-btn" id="btn-menu" aria-label="Меню">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <line x1="3" y1="6" x2="21" y2="6"/>
+        <line x1="3" y1="12" x2="21" y2="12"/>
+        <line x1="3" y1="18" x2="21" y2="18"/>
+      </svg>
+    </button>
+  </header>
+
+  <!-- ═══ MAIN ═══ -->
+  <main class="main">
+
+    <!-- ШАГ 0 — ВВОДНАЯ -->
+    <section class="page" id="step-intro">
+
+      <div class="intro-header">
+        <div class="intro-label">Идентификация</div>
+        <h1 class="intro-title">Привяжи<br/>аккаунт</h1>
+        <p class="intro-desc">Бот будет знать, кто ты в клане. Займёт меньше двух минут.</p>
+      </div>
+
+      <div class="steps-list">
+        <div class="step-row">
+          <div class="step-row__num">01</div>
+          <div class="step-row__body">
+            <div class="step-row__title">Введи тег игрока</div>
+            <div class="step-row__desc">Находим твою деревню в базе данных</div>
+          </div>
+        </div>
+        <div class="step-row">
+          <div class="step-row__num">02</div>
+          <div class="step-row__body">
+            <div class="step-row__title">Подтверди токеном</div>
+            <div class="step-row__desc">Из настроек игры — занимает 30 секунд</div>
+          </div>
+        </div>
+        <div class="step-row">
+          <div class="step-row__num">03</div>
+          <div class="step-row__body">
+            <div class="step-row__title">Готово</div>
+            <div class="step-row__desc">Бот тебя запомнил</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="alert-box">
+        <div class="alert-box__icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+        </div>
+        <p><strong>Токен безопасен.</strong> Он только подтверждает владение деревней и не даёт никакого доступа к аккаунту.</p>
+      </div>
+
+      <button type="button" class="btn btn--primary btn--full" id="btn-start">
+        Начать
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <path d="M5 12h14M12 5l7 7-7 7"/>
+        </svg>
+      </button>
+
+    </section>
+
+    <!-- ШАГ 1 — ТЕГ -->
+    <section class="page hidden" id="step-tag">
+
+      <div class="progress-track">
+        <div class="progress-track__bar">
+          <div class="progress-track__fill" style="width:33%"></div>
+        </div>
+        <div class="progress-track__meta">
+          <span class="progress-track__step">Шаг 1 из 3</span>
+          <span class="progress-track__name">Тег игрока</span>
+        </div>
+      </div>
+
+      <div class="page-head">
+        <h2>Тег игрока</h2>
+        <p id="tg-user-line">Введи тег своей деревни</p>
+      </div>
+
+      <div class="field-wrap">
+        <label class="field-label" for="tag-input">Тег деревни</label>
+        <div class="field-row">
+          <span class="field-prefix">#</span>
+          <input
+            id="tag-input"
+            class="field-input"
+            type="text"
+            inputmode="text"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="characters"
+            spellcheck="false"
+            placeholder="QV8CUPJ92"
+          />
+        </div>
+        <div class="field-hint">Можно вставить с решёткой — уберу сам</div>
+      </div>
+
+      <div class="status-box hidden" id="status-tag"></div>
+
+      <button type="button" class="btn btn--primary btn--full" id="btn-lookup">
+        Найти аккаунт
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>
+        </svg>
+      </button>
+
+    </section>
+
+    <!-- ШАГ 2 — ПОДТВЕРЖДЕНИЕ -->
+    <section class="page hidden" id="step-confirm">
+
+      <div class="progress-track">
+        <div class="progress-track__bar">
+          <div class="progress-track__fill" style="width:60%"></div>
+        </div>
+        <div class="progress-track__meta">
+          <span class="progress-track__step">Шаг 2 из 3</span>
+          <span class="progress-track__name">Проверка</span>
+        </div>
+      </div>
+
+      <div class="page-head">
+        <h2>Это твой аккаунт?</h2>
+        <p>Проверь данные перед продолжением</p>
+      </div>
+
+      <div class="data-table" id="player-card"></div>
+
+      <div class="btn-row">
+        <button type="button" class="btn btn--ghost" id="btn-no">Другой тег</button>
+        <button type="button" class="btn btn--primary" id="btn-yes">
+          Да, это я
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <path d="M5 12h14M12 5l7 7-7 7"/>
+          </svg>
+        </button>
+      </div>
+
+    </section>
+
+    <!-- ШАГ 3 — ТОКЕН -->
+    <section class="page hidden" id="step-token">
+
+      <div class="progress-track">
+        <div class="progress-track__bar">
+          <div class="progress-track__fill" style="width:85%"></div>
+        </div>
+        <div class="progress-track__meta">
+          <span class="progress-track__step">Шаг 3 из 3</span>
+          <span class="progress-track__name">Токен</span>
+        </div>
+      </div>
+
+      <div class="page-head">
+        <h2>Токен из игры</h2>
+        <p>Последний шаг — подтверди владение</p>
+      </div>
+
+      <div class="instruction">
+        <div class="instruction__head">Как получить токен</div>
+        <div class="instruction__step">
+          <span class="instruction__n">1</span>
+          <span>Открой <strong>Настройки</strong> в игре</span>
+        </div>
+        <div class="instruction__step">
+          <span class="instruction__n">2</span>
+          <span>Перейди в <strong>Дополнительные настройки</strong></span>
+        </div>
+        <div class="instruction__step">
+          <span class="instruction__n">3</span>
+          <span>Нажми <strong>Авторизационный токен</strong></span>
+        </div>
+      </div>
+
+      <div class="field-wrap">
+        <label class="field-label" for="token-input">Токен</label>
+        <input
+          id="token-input"
+          class="field-input field-input--standalone"
+          type="text"
+          inputmode="text"
+          autocomplete="off"
+          autocorrect="off"
+          spellcheck="false"
+          placeholder="rdckezca"
+        />
+        <div class="field-hint">Обычно 8 символов, строчные латинские буквы</div>
+      </div>
+
+      <div class="status-box hidden" id="status-token"></div>
+
+      <button type="button" class="btn btn--primary btn--full" id="btn-verify">
+        Подтвердить
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+      </button>
+
+    </section>
+
+    <!-- ШАГ 4 — ГОТОВО -->
+    <section class="page hidden" id="step-done">
+
+      <div class="success-block">
+        <div class="success-block__icon">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+        </div>
+        <div>
+          <div class="success-block__title">Привязка установлена</div>
+          <div class="success-block__sub">Бот тебя запомнил</div>
+        </div>
+      </div>
+
+      <p class="done-desc" id="done-text"></p>
+
+      <div class="data-table" id="me-card"></div>
+
+      <div class="action-stack">
+        <button type="button" class="btn btn--ghost btn--full" id="btn-change">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 12h16M15 6l6 6-6 6"/>
+          </svg>
+          Сменить аккаунт
+        </button>
+        <button type="button" class="btn btn--danger btn--full" id="btn-unlink">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/>
+          </svg>
+          Удалить привязку
+        </button>
+        <button type="button" class="btn btn--primary btn--full" id="btn-close">
+          Закрыть
+        </button>
+      </div>
+
+    </section>
+
+  </main>
+
+  <footer class="foot">
+    Clash Bot · Не является официальным продуктом Supercell
+  </footer>
+
+</div>
+<script src="./app.js"></script>
+</body>
+</html>
