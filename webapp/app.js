@@ -1,386 +1,381 @@
 (() => {
-  const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  /* ─── Telegram WebApp ─── */
+  const tg = window.Telegram?.WebApp ?? null;
   try {
     if (tg) {
       tg.ready();
       tg.expand();
       tg.enableClosingConfirmation();
-      if (tg.setHeaderColor) tg.setHeaderColor("#0b0f14");
-      if (tg.setBackgroundColor) tg.setBackgroundColor("#0b0f14");
+      if (tg.setHeaderColor)     tg.setHeaderColor("#ffffff");
+      if (tg.setBackgroundColor) tg.setBackgroundColor("#fafafa");
     }
   } catch (_) {}
 
-  const $ = (id) => document.getElementById(id);
+  /* ─── Refs ─── */
+  const $ = id => document.getElementById(id);
 
-  const stepIntro = $("step-intro");
-  const stepTag = $("step-tag");
+  const stepIntro   = $("step-intro");
+  const stepTag     = $("step-tag");
   const stepConfirm = $("step-confirm");
-  const stepToken = $("step-token");
-  const stepDone = $("step-done");
+  const stepToken   = $("step-token");
+  const stepDone    = $("step-done");
+  const ALL_STEPS   = [stepIntro, stepTag, stepConfirm, stepToken, stepDone];
 
-  const tgUserLine = $("tg-user-line");
-  const tagInput = $("tag-input");
-  const tokenInput = $("token-input");
-  const statusTag = $("status-tag");
+  const tgUserLine  = $("tg-user-line");
+  const tagInput    = $("tag-input");
+  const tokenInput  = $("token-input");
+  const statusTag   = $("status-tag");
   const statusToken = $("status-token");
-  const playerCard = $("player-card");
-  const doneText = $("done-text");
+  const playerCard  = $("player-card");
+  const meCard      = $("me-card");
+  const doneText    = $("done-text");
 
-  const btnStart = $("btn-start");
+  const btnStart  = $("btn-start");
   const btnLookup = $("btn-lookup");
-  const btnYes = $("btn-yes");
-  const btnNo = $("btn-no");
+  const btnYes    = $("btn-yes");
+  const btnNo     = $("btn-no");
   const btnVerify = $("btn-verify");
-  const btnClose = $("btn-close");
+  const btnClose  = $("btn-close");
   const btnChange = $("btn-change");
   const btnUnlink = $("btn-unlink");
 
-  const btnMenu = $("btn-menu");
-  const drawer = $("drawer");
-  const backdrop = $("backdrop");
-  const drawerMe = $("drawer-me");
+  const btnMenu      = $("btn-menu");
+  const drawer       = $("drawer");
+  const backdrop     = $("backdrop");
+  const drawerClose  = $("drawer-close");
+  const drawerMe     = $("drawer-me");
   const drawerChange = $("drawer-change");
   const drawerUnlink = $("drawer-unlink");
-  const drawerClose = $("drawer-close");
 
-  const meCard = $("me-card");
-  const loading = $("loading");
+  const loading      = $("loading");
   const loadingTitle = $("loading-title");
-  const loadingText = $("loading-text");
+  const loadingText  = $("loading-text");
 
-  let initData = "";
+  let initData    = "";
   let selectedTag = "";
-  let lastPlayer = null;
+  let lastPlayer  = null;
 
-  function show(el) {
-    [stepIntro, stepTag, stepConfirm, stepToken, stepDone].forEach((x) =>
-      x.classList.add("hidden")
-    );
-    el.classList.remove("hidden");
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  }
-
-  function openDrawer() {
-    drawer.classList.remove("hidden");
-    backdrop.classList.remove("hidden");
-    drawer.setAttribute("aria-hidden", "false");
-  }
-  function closeDrawer() {
-    drawer.classList.add("hidden");
-    backdrop.classList.add("hidden");
-    drawer.setAttribute("aria-hidden", "true");
-  }
-
-  function setLoading(on, title, text) {
-    if (!loading) return;
-    if (on) {
-      if (loadingTitle) loadingTitle.textContent = title || "Загружаю…";
-      if (loadingText) loadingText.textContent = text || "Секунду.";
-      loading.classList.remove("hidden");
-    } else {
-      loading.classList.add("hidden");
-    }
+  /* ─── Utils ─── */
+  function esc(s) {
+    return String(s ?? "")
+      .replace(/&/g,  "&amp;")
+      .replace(/</g,  "&lt;")
+      .replace(/>/g,  "&gt;")
+      .replace(/"/g,  "&quot;")
+      .replace(/'/g,  "&#039;");
   }
 
   function normTag(raw) {
-    let t = (raw || "").trim();
+    let t = (raw ?? "").trim();
     if (!t) return "";
     if (t.toLowerCase().startsWith("%23")) t = "#" + t.slice(3);
     if (!t.startsWith("#")) t = "#" + t;
     return t.toUpperCase();
   }
 
-  function tagLooksValid(tag) {
-    const cleaned = (tag || "").replace(/^#/, "");
-    if (cleaned.length < 3 || cleaned.length > 12) return false;
-    return /^[0289PYLQGRJCUV]+$/.test(cleaned);
+  // CoC tag alphabet: 0 2 8 9 P Y L Q G R J C U V
+  function tagValid(tag) {
+    const c = tag.replace(/^#/, "");
+    return c.length >= 3 && c.length <= 12 && /^[0289PYLQGRJCUV]+$/.test(c);
   }
+
+  /* ─── Navigation ─── */
+  function show(el) {
+    ALL_STEPS.forEach(x => x.classList.add("hidden"));
+    el.classList.remove("hidden");
+    el.style.animation = "none";
+    void el.offsetHeight;
+    el.style.animation = "";
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  /* ─── Sidebar ─── */
+  function openDrawer() {
+    drawer.setAttribute("aria-hidden", "false");
+    document.body.style.overflow = "hidden";
+  }
+
+  function closeDrawer() {
+    drawer.setAttribute("aria-hidden", "true");
+    document.body.style.overflow = "";
+  }
+
+  /* ─── Loader ─── */
+  function setLoading(on, title, sub) {
+    if (!loading) return;
+    if (on) {
+      loadingTitle.textContent = title || "Загружаю";
+      loadingText.textContent  = sub   || "Секунду";
+      loading.classList.remove("hidden");
+    } else {
+      loading.classList.add("hidden");
+    }
+  }
+
+  /* ─── Status ─── */
+  const S_ICON = {
+    ok: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
+    bad:`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 5l14 14M19 5 5 19"/></svg>`,
+    info:`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>`,
+  };
 
   function setStatus(el, type, text) {
-    const label =
-      type === "ok" ? "Готово" : type === "bad" ? "Ошибка" : "Проверяю";
-    const pillClass = type === "ok" ? "ok" : type === "bad" ? "bad" : "info";
-    const icon = statusIconSvg(type);
-    el.innerHTML = `
-      <span class="pill ${pillClass}"><span class="pillIcon">${icon}</span>${label}</span>
-      <span>${text || ""}</span>
-    `;
+    el.className = `status-box status--${type}`;
+    el.classList.remove("hidden");
+    el.innerHTML = `<span class="status-box__icon">${S_ICON[type] ?? ""}</span><span>${esc(text)}</span>`;
   }
 
-  function statusIconSvg(type) {
-    if (type === "ok") {
-      return `
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M9.2 16.6 4.9 12.3a1.2 1.2 0 1 1 1.7-1.7l2.6 2.6 8.2-8.2a1.2 1.2 0 1 1 1.7 1.7l-9.9 9.9a1.2 1.2 0 0 1-1.7 0Z"/>
-        </svg>`;
-    }
-    if (type === "bad") {
-      return `
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M13.7 12 18.3 7.4a1.2 1.2 0 0 0-1.7-1.7L12 10.3 7.4 5.7a1.2 1.2 0 1 0-1.7 1.7L10.3 12l-4.6 4.6a1.2 1.2 0 1 0 1.7 1.7l4.6-4.6 4.6 4.6a1.2 1.2 0 0 0 1.7-1.7L13.7 12Z"/>
-        </svg>`;
-    }
-    // info/loading
-    return `
-      <svg class="spin" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M12 3.2a8.8 8.8 0 1 0 8.8 8.8 1.2 1.2 0 1 0-2.4 0A6.4 6.4 0 1 1 12 5.6a1.2 1.2 0 1 0 0-2.4Z"/>
-      </svg>`;
+  function hideStatus(el) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
   }
 
+  /* ─── API ─── */
   async function api(path, payload) {
+    try { if (tg) initData = tg.initData || initData; } catch (_) {}
+
+    const labels = {
+      "/api/lookup": "Ищу игрока",
+      "/api/verify": "Проверяю токен",
+      "/api/me":     "Проверяю привязку",
+      "/api/unlink": "Удаляю привязку",
+    };
+    setLoading(true, labels[path] || "Загружаю", "Пара секунд");
+
     try {
-      if (!initData && tg) initData = tg.initData || "";
-    } catch (_) {}
-    // Small UI hint: show overlay for network calls (prevents "nothing happens" feeling)
-    const label =
-      path === "/api/lookup"
-        ? "Ищу игрока…"
-        : path === "/api/verify"
-          ? "Проверяю токен…"
-          : path === "/api/me"
-            ? "Проверяю привязку…"
-            : path === "/api/unlink"
-              ? "Удаляю привязку…"
-              : "Загружаю…";
-    setLoading(true, label, "Пара секунд.");
-    try {
-      const res = await fetch(path, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload || {}),
+      const res  = await fetch(path, {
+        method:  "POST",
+        headers: {
+          "Content-Type":         "application/json",
+          "X-Telegram-Init-Data": initData,
+        },
+        body: JSON.stringify(payload ?? {}),
       });
+
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data || data.ok === false) {
-        const msg = (data && data.error) || "Не удалось выполнить запрос.";
-        throw new Error(msg);
+      if (!res.ok || data?.ok === false) {
+        throw new Error(data?.error || "Не удалось выполнить запрос.");
       }
       return data;
+
+    } catch (e) {
+      if (e instanceof TypeError) {
+        throw new Error("Нет соединения. Проверь интернет и попробуй снова.");
+      }
+      throw e;
     } finally {
       setLoading(false);
     }
   }
 
-  function renderPlayerCard(player) {
-    const rows = [
-      ["Ник", player.name || "—"],
-      ["Тег", player.tag || "—"],
-      ["ТХ", player.townHallLevel ? "ТХ " + player.townHallLevel : "—"],
-      ["Уровень", player.expLevel != null ? String(player.expLevel) : "—"],
-      ["Лига", (player.league && player.league.name) || "—"],
-      ["Клан", (player.clan && player.clan.name) || "Без клана"],
-    ];
-    playerCard.innerHTML = rows
-      .map(
-        ([k, v]) => `
-        <div class="playerLine">
-          <div class="playerKey">${k}</div>
-          <div class="playerVal">${escapeHtml(v)}</div>
-        </div>`
-      )
-      .join("");
+  /* ─── Render ─── */
+  function rows(pairs) {
+    return pairs.map(([k, v]) => `
+      <div class="data-row">
+        <div class="data-row__key">${esc(k)}</div>
+        <div class="data-row__val">${esc(v)}</div>
+      </div>`).join("");
   }
 
-  function renderMeCard(player) {
-    if (!meCard) return;
-    if (!player || !player.tag) {
-      meCard.innerHTML = "";
-      return;
-    }
-    const rows = [
-      ["Ник", player.name || "—"],
-      ["Тег", player.tag || "—"],
-      ["ТХ", player.townHallLevel ? "ТХ " + player.townHallLevel : "—"],
-      ["Лига", (player.league && player.league.name) || "—"],
-      ["Клан", (player.clan && player.clan.name) || "Без клана"],
-    ];
-    meCard.innerHTML = rows
-      .map(
-        ([k, v]) => `
-        <div class="playerLine">
-          <div class="playerKey">${k}</div>
-          <div class="playerVal">${escapeHtml(v)}</div>
-        </div>`
-      )
-      .join("");
+  function renderPlayer(target, p) {
+    if (!target) return;
+    if (!p) { target.innerHTML = ""; return; }
+    target.innerHTML = rows([
+      ["Ник",     p.name            || "—"],
+      ["Тег",     p.tag             || "—"],
+      ["ТХ",      p.townHallLevel   ? `ТХ ${p.townHallLevel}` : "—"],
+      ["Уровень", p.expLevel != null ? String(p.expLevel)     : "—"],
+      ["Лига",    p.league?.name    || "—"],
+      ["Клан",    p.clan?.name      || "Без клана"],
+    ]);
   }
 
-  function escapeHtml(s) {
-    return String(s || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
-
-  function fillTelegramUser() {
+  /* ─── TG user ─── */
+  function fillUser() {
     if (!tg) {
-      tgUserLine.textContent =
-        "Открой это окно через кнопку в боте — так я пойму, кто ты в Telegram.";
+      tgUserLine.textContent = "Открой через бота — так я пойму, кто ты.";
       return;
     }
-    const u = (tg.initDataUnsafe && tg.initDataUnsafe.user) || null;
-    if (!u) {
-      tgUserLine.textContent =
-        "Не получилось получить профиль Telegram. Закрой окно и открой снова через бота.";
-      return;
-    }
-    const uname = u.username ? "@" + u.username : "без username";
-    tgUserLine.textContent = `Ты в Telegram: ${u.first_name || "Пользователь"} (${uname})`;
+    const u = tg.initDataUnsafe?.user;
+    if (!u) { tgUserLine.textContent = "Не удалось получить профиль. Закрой и открой снова."; return; }
+    const uname = u.username ? `@${u.username}` : "без username";
+    tgUserLine.textContent = `${u.first_name || "Пользователь"} · ${uname}`;
   }
+
+  /* ─── Confirm ─── */
+  function safeConfirm(msg, cb) {
+    if (tg?.showConfirm) tg.showConfirm(msg, cb);
+    else cb(window.confirm(msg));
+  }
+
+  /* ─── withBtn ─── */
+  async function withBtn(btn, fn) {
+    btn.disabled = true;
+    try { await fn(); } finally { btn.disabled = false; }
+  }
+
+  /* ═══════════════════════════
+     HANDLERS
+  ═══════════════════════════ */
 
   btnStart.addEventListener("click", () => {
+    try { if (tg) initData = tg.initData || initData; } catch (_) {}
+    fillUser();
+    hideStatus(statusTag);
+    tagInput.value = "";
     show(stepTag);
-    fillTelegramUser();
-    setStatus(statusTag, "info", "Введи тег и нажми «Найти».");
-    try {
-      if (tg) initData = tg.initData || initData || "";
-    } catch (_) {}
+    setTimeout(() => tagInput.focus(), 200);
   });
 
-  btnLookup.addEventListener("click", async () => {
-    const tag = normTag(tagInput.value);
-    if (!tagLooksValid(tag)) {
-      setStatus(statusTag, "bad", "Тег выглядит странно. Проверь и попробуй ещё раз.");
-      return;
-    }
-    setStatus(statusTag, "info", "Ищу игрока…");
-    try {
-      const data = await api("/api/lookup", { initData, tag });
-      lastPlayer = data.player || null;
-      selectedTag = tag;
-      renderPlayerCard(lastPlayer || {});
-      show(stepConfirm);
-    } catch (e) {
-      setStatus(statusTag, "bad", e.message || "Ошибка.");
-    }
-  });
+  btnLookup.addEventListener("click", () =>
+    withBtn(btnLookup, async () => {
+      const tag = normTag(tagInput.value);
+      if (!tagValid(tag)) {
+        setStatus(statusTag, "bad", "Тег выглядит неверно. Пример: #QV8CUPJ92");
+        return;
+      }
+      setStatus(statusTag, "info", "Ищу в базе данных…");
+      try {
+        const data = await api("/api/lookup", { initData, tag });
+        lastPlayer  = data.player || null;
+        selectedTag = tag;
+        renderPlayer(playerCard, lastPlayer);
+        hideStatus(statusTag);
+        show(stepConfirm);
+      } catch (e) {
+        setStatus(statusTag, "bad", e.message || "Ошибка.");
+      }
+    })
+  );
 
   btnNo.addEventListener("click", () => {
-    lastPlayer = null;
+    lastPlayer  = null;
     selectedTag = "";
     show(stepTag);
-    setStatus(statusTag, "info", "Ок, введи другой тег.");
+    setStatus(statusTag, "info", "Введи другой тег.");
   });
 
   btnYes.addEventListener("click", () => {
-    if (!selectedTag) {
-      show(stepTag);
-      return;
-    }
-    show(stepToken);
+    if (!selectedTag) { show(stepTag); return; }
     tokenInput.value = "";
-    setStatus(statusToken, "info", "Введи токен и нажми «Подтвердить».");
+    hideStatus(statusToken);
+    show(stepToken);
+    setTimeout(() => tokenInput.focus(), 200);
   });
 
-  btnVerify.addEventListener("click", async () => {
-    const token = (tokenInput.value || "").trim();
-    if (token.length < 6) {
-      setStatus(statusToken, "bad", "Токен слишком короткий.");
-      return;
-    }
-    setStatus(statusToken, "info", "Проверяю…");
-    try {
-      const data = await api("/api/verify", { initData, tag: selectedTag, token });
-      setStatus(statusToken, "ok", "Готово.");
-      show(stepDone);
-      const player = (data && data.player) || lastPlayer || null;
-      const name = (player && player.name) || "игрок";
-      lastPlayer = player;
-      renderMeCard(player);
-      doneText.innerHTML = `Готово: <b>${escapeHtml(name)}</b> <code>${escapeHtml(selectedTag)}</code>.<br/>Можно закрывать окно — бот уже запомнил привязку.`;
+  btnVerify.addEventListener("click", () =>
+    withBtn(btnVerify, async () => {
+      const token = (tokenInput.value || "").trim();
+      if (token.length < 6) {
+        setStatus(statusToken, "bad", "Токен слишком короткий.");
+        return;
+      }
+      setStatus(statusToken, "info", "Проверяю…");
       try {
-        if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
-      } catch (_) {}
-    } catch (e) {
-      const msg = e.message || "Ошибка.";
-      setStatus(
-        statusToken,
-        "bad",
-        msg.includes("истек")
-          ? "Похоже, токен уже истёк. Нажми в игре «Авторизационный токен» ещё раз и введи новый."
-          : msg
-      );
-      try {
-        if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("error");
-      } catch (_) {}
-    }
-  });
+        const data   = await api("/api/verify", { initData, tag: selectedTag, token });
+        const player = data?.player || lastPlayer || null;
+        lastPlayer   = player;
+
+        renderPlayer(meCard, player);
+        doneText.innerHTML = `Привязан аккаунт <strong>${esc(player?.name || "игрок")}</strong> <code>${esc(selectedTag)}</code>. Можно закрывать — бот всё запомнил.`;
+        show(stepDone);
+
+        try { if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred("success"); } catch (_) {}
+      } catch (e) {
+        const msg = e.message || "Ошибка.";
+        setStatus(
+          statusToken, "bad",
+          msg.includes("истек") || msg.includes("истёк")
+            ? "Токен истёк. Нажми «Авторизационный токен» в игре ещё раз."
+            : msg
+        );
+        try { if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred("error"); } catch (_) {}
+      }
+    })
+  );
 
   btnClose.addEventListener("click", () => {
-    try {
-      if (tg) tg.close();
-    } catch (_) {}
-    // fallback
+    try { if (tg) tg.close(); } catch (_) {}
     window.close();
   });
 
   btnChange.addEventListener("click", () => {
+    tagInput.value = "";
+    hideStatus(statusTag);
+    fillUser();
     show(stepTag);
-    fillTelegramUser();
-    setStatus(statusTag, "info", "Введи тег и нажми «Найти».");
+    setTimeout(() => tagInput.focus(), 200);
   });
 
   async function doUnlink() {
-    if (!confirm("Удалить привязку?")) return;
-    try {
-      await api("/api/unlink", { initData });
-      lastPlayer = null;
-      selectedTag = "";
-      renderMeCard(null);
-      show(stepIntro);
-    } catch (e) {
-      alert(e.message || "Не удалось удалить привязку.");
-    }
+    safeConfirm("Удалить привязку аккаунта?", async confirmed => {
+      if (!confirmed) return;
+      try {
+        await api("/api/unlink", { initData });
+        lastPlayer  = null;
+        selectedTag = "";
+        show(stepIntro);
+        try { if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred("success"); } catch (_) {}
+      } catch (e) {
+        if (tg?.showAlert) tg.showAlert(e.message || "Не удалось удалить привязку.");
+        else alert(e.message || "Не удалось удалить привязку.");
+      }
+    });
   }
 
   btnUnlink.addEventListener("click", doUnlink);
 
+  /* ─── Sidebar ─── */
   btnMenu.addEventListener("click", openDrawer);
   backdrop.addEventListener("click", closeDrawer);
   drawerClose.addEventListener("click", closeDrawer);
+
   drawerMe.addEventListener("click", () => {
     closeDrawer();
-    show(stepDone);
+    if (lastPlayer) show(stepDone);
+    else show(stepIntro);
   });
+
   drawerChange.addEventListener("click", () => {
     closeDrawer();
+    tagInput.value = "";
+    hideStatus(statusTag);
+    fillUser();
     show(stepTag);
-    fillTelegramUser();
-    setStatus(statusTag, "info", "Введи тег и нажми «Найти».");
+    setTimeout(() => tagInput.focus(), 350);
   });
+
   drawerUnlink.addEventListener("click", async () => {
     closeDrawer();
     await doUnlink();
   });
 
-  // initial
-  try {
-    if (tg) initData = tg.initData || "";
-  } catch (_) {}
+  /* ─── Keyboard ─── */
+  tagInput.addEventListener("keydown",   e => { if (e.key === "Enter") btnLookup.click(); });
+  tokenInput.addEventListener("keydown", e => { if (e.key === "Enter") btnVerify.click(); });
+
+  tagInput.addEventListener("input", () => {
+    tagInput.value = tagInput.value.replace(/[^0-9A-Za-z#]/g, "");
+  });
+
+  /* ─── Boot ─── */
+  try { if (tg) initData = tg.initData || ""; } catch (_) {}
 
   async function boot() {
-    setStatus(statusTag, "info", "Нажми «Начать», чтобы привязать аккаунт.");
     if (!tg) return;
-    try {
-      initData = tg.initData || initData || "";
-    } catch (_) {}
+    try { initData = tg.initData || initData; } catch (_) {}
     if (!initData) return;
     try {
       const data = await api("/api/me", { initData });
-      if (data && data.linked && data.player) {
+      if (data?.linked && data?.player) {
         const p = data.player;
-        const name = p.name || "игрок";
-        const tag = p.tag || "";
-        lastPlayer = p;
-        selectedTag = normTag(tag);
+        lastPlayer  = p;
+        selectedTag = normTag(p.tag || "");
+        renderPlayer(meCard, p);
+        doneText.innerHTML = `Привязан аккаунт <strong>${esc(p.name || "игрок")}</strong> <code>${esc(selectedTag)}</code>.`;
         show(stepDone);
-        doneText.innerHTML = `Сейчас привязано: <b>${escapeHtml(name)}</b> <code>${escapeHtml(selectedTag)}</code>.`;
-        renderMeCard(p);
       }
-    } catch (_) {
-      // ignore
-    }
+    } catch (_) { /* нет привязки — остаёмся на intro */ }
   }
 
   boot();
