@@ -46,14 +46,34 @@ try:
 except Exception:
     asyncpg = None
 
-_TELEGRAM_BOT_TOKEN_ENV = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-TELEGRAM_BOT_TOKEN: str = (
-    _TELEGRAM_BOT_TOKEN_ENV
-    or ""
-).strip()
+def _load_local_env(filename: str = ".env") -> None:
+    env_path = os.path.join(os.path.dirname(__file__), filename)
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                    value = value[1:-1]
+                os.environ[key] = value
+    except Exception:
+        pass
 
-CLASH_EMAIL: str = "imprayimpray4@gmail.com"
-CLASH_PASSWORD: str = "My happy life43"
+
+_load_local_env()
+
+TELEGRAM_BOT_TOKEN: str = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+
+CLASH_EMAIL: str = (os.environ.get("CLASH_EMAIL") or "").strip()
+CLASH_PASSWORD: str = (os.environ.get("CLASH_PASSWORD") or "").strip()
 
 CLAN_TAG: str = "#2GYQ8VJV2"
 
@@ -72,8 +92,8 @@ CHAT_ID: int = -1002552886756
 CHAT_MAIN_THREAD_ID: int = 0
 CHAT_ADMIN_THREAD_ID: int = 0
 
-# Supabase (Postgres) connection string (same settings as bot.py; hardcoded as requested)
-DATABASE_URL: str = "postgresql://postgres.jqiomtvtvtsizubzunhb:My%20happy%20life64@aws-1-eu-north-1.pooler.supabase.com:5432/postgres"
+# Supabase (Postgres) connection string.
+DATABASE_URL: str = (os.environ.get("DATABASE_URL") or "").strip()
 
 # Public base URL for Telegram Mini App (must be HTTPS for Telegram Web Apps)
 _RENDER_EXTERNAL_URL = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
@@ -86,11 +106,7 @@ PUBLIC_BASE_URL: str = (
     or "http://localhost:10000"
 )
 
-# WebApp auth/session settings
-WEBAPP_SESSION_TTL_SECONDS: int = 15 * 60
-
 _pg_pool: object | None = None
-_webapp_sessions: dict[str, dict] = {}
 _links_cache: dict[str, int] = {}  # COC_TAG -> telegram_user_id
 _links_cache_loaded_at: float = 0.0
 LINKS_CACHE_TTL_SECONDS: int = 300  # 5 minutes
@@ -123,10 +139,7 @@ _clash_token_source: str = "unset"  # "clashapi" | "unset"
 
 # Notification tasks per chat (group/supergroup)
 _notify_tasks: dict[int, asyncio.Task] = {}
-_notify_message_ids: dict[int, int] = {}
 
-# Notification tasks
-_broadcast_tasks: dict[int, asyncio.Task] = {}  # legacy name: used for notify loop tasks
 _broadcast_sent: dict[str, dict[str, float]] = {}  # kept for backward compatibility (no longer used heavily)
 
 SHUTDOWN_EVENT = asyncio.Event()
@@ -1080,6 +1093,10 @@ async def _pg_ensure_schema() -> None:
         )
 
 
+class LinkAlreadyBoundError(RuntimeError):
+    pass
+
+
 async def _db_upsert_link(
     *,
     telegram_user_id: int,
@@ -1087,27 +1104,46 @@ async def _db_upsert_link(
     coc_name: str,
     tg_username: str = "",
     tg_first_name: str = "",
-) -> None:
+) -> bool:
     pool = await _pg_get_pool()
+    uid = int(telegram_user_id)
     coc_tag_n = _norm_tag(coc_tag)
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO coc_links (telegram_user_id, coc_tag, coc_name, tg_username, tg_first_name, verified_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-            ON CONFLICT (telegram_user_id) DO UPDATE
-            SET coc_tag = EXCLUDED.coc_tag,
-                coc_name = EXCLUDED.coc_name,
-                tg_username = EXCLUDED.tg_username,
-                tg_first_name = EXCLUDED.tg_first_name,
-                updated_at = NOW();
-            """,
-            int(telegram_user_id),
-            coc_tag_n,
-            str(coc_name or ""),
-            str(tg_username or ""),
-            str(tg_first_name or ""),
+        current = await conn.fetchrow(
+            "SELECT coc_tag FROM coc_links WHERE telegram_user_id=$1",
+            uid,
         )
+        existing = await conn.fetchrow(
+            "SELECT telegram_user_id FROM coc_links WHERE coc_tag=$1",
+            coc_tag_n,
+        )
+        if existing and int(existing["telegram_user_id"]) != uid:
+            raise LinkAlreadyBoundError("Этот Clash-аккаунт уже привязан к другому Telegram-профилю.")
+
+        try:
+            await conn.execute(
+                """
+                INSERT INTO coc_links (telegram_user_id, coc_tag, coc_name, tg_username, tg_first_name, verified_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+                ON CONFLICT (telegram_user_id) DO UPDATE
+                SET coc_tag = EXCLUDED.coc_tag,
+                    coc_name = EXCLUDED.coc_name,
+                    tg_username = EXCLUDED.tg_username,
+                    tg_first_name = EXCLUDED.tg_first_name,
+                    updated_at = NOW();
+                """,
+                uid,
+                coc_tag_n,
+                str(coc_name or ""),
+                str(tg_username or ""),
+                str(tg_first_name or ""),
+            )
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "coc_links_coc_tag_uidx" in msg or ("duplicate key" in msg and "coc_tag" in msg):
+                raise LinkAlreadyBoundError("Этот Clash-аккаунт уже привязан к другому Telegram-профилю.") from exc
+            raise
+        return not current or _norm_tag(current["coc_tag"]) != coc_tag_n
 
 
 async def _refresh_links_cache(force: bool = False) -> None:
@@ -2205,8 +2241,9 @@ async def _build_and_send_player_report(
     player = await _api(get_player_info, tag)
     err = check_api_error(player, context="player stats report")
     if err:
-        if reply_to_message:
-            await _edit_or_send(reply_to_message, err, main_menu_keyboard())
+        target_message = reply_to_message or progress_message
+        if target_message:
+            await _edit_or_send(target_message, err, main_menu_keyboard())
         return None
 
     await _progress(1, total_steps, "Проверяю клан…")
@@ -2958,6 +2995,8 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
             duration = max(1, int((end_dt - start_dt).total_seconds()))
             elapsed = int((now - start_dt).total_seconds())
             remaining = int((end_dt - now).total_seconds())
+            if state == "inWar" and elapsed > poll_seconds * 2 and "start" not in sent:
+                sent.add("start")
 
             # Missing list (only meaningful inWar)
             attacks_per_member = 1 if kind == "ЛВК" else int(war.get("attacksPerMember", 2) or 2)
@@ -3064,148 +3103,6 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
             logger.error("Broadcast loop error for chat %s: %s", chat_id, exc)
             await asyncio.sleep(poll_seconds)
 
-
-async def _notify_loop(bot: Bot, chat_id: int) -> None:
-    """
-    Periodically sends reminders to a group chat about missing attacks in war/CWL.
-    """
-    poll_seconds = 300  # 5 minutes
-    min_repeat_seconds = 900  # 15 minutes (avoid same message too often)
-    last_fingerprint: str | None = None
-    last_sent_at: float = 0.0
-
-    # CWL scan optimization:
-    # When CWL season exists but there is no active/prep war, scanning all wars every 5 minutes is expensive.
-    cwl_next_scan_at: float = 0.0
-    cwl_scan_cooldown_seconds: int = 900  # 15 minutes
-
-    # For forum supergroups: pin the reminders into the configured main topic (if set),
-    # otherwise they will land in "General".
-    topic_tid: int | None = None
-    try:
-        if int(chat_id) == int(CHAT_ID) and int(CHAT_MAIN_THREAD_ID or 0) > 0:
-            topic_tid = int(CHAT_MAIN_THREAD_ID)
-    except Exception:
-        topic_tid = None
-
-    while True:
-        try:
-            await _refresh_links_cache()
-            title = None
-            missing: list[str] = []
-            state = ""
-            end_time = ""
-            context = ""
-
-            cwl_tag = None
-            cwl_war = None
-            if time.time() >= cwl_next_scan_at:
-                cwl_tag, cwl_war = await asyncio.to_thread(get_current_cwl_war_for_clan)
-                # If no active/prep CWL war was found, delay the next full scan.
-                if not cwl_tag:
-                    cwl_next_scan_at = time.time() + cwl_scan_cooldown_seconds
-            if cwl_tag and isinstance(cwl_war, dict) and not cwl_war.get("_error"):
-                context = "ЛВК"
-                title, missing, state, end_time = get_war_missing_attacks(cwl_war, CLAN_TAG)
-            else:
-                war = await asyncio.to_thread(get_current_war, CLAN_TAG)
-                if isinstance(war, dict) and not war.get("_error"):
-                    context = "КВ"
-                    title, missing, state, end_time = get_war_missing_attacks(war, CLAN_TAG)
-
-            # Build status text (always keep one message alive and updated)
-            time_left = _time_left(end_time)
-            state_label = "подготовка" if state == "preparation" else ("война" if state == "inWar" else "—")
-
-            if not context or state not in {"preparation", "inWar"}:
-                header = "🔔 <b>Уведомления активны</b>"
-                body = (
-                    "Сейчас активных войн нет.\n"
-                    "<i>Я проверяю обстановку автоматически и обновляю это сообщение.</i>"
-                )
-                fingerprint = f"idle|{state}"
-            elif state == "preparation":
-                header = f"🔔 <b>{context}: идёт подготовка</b>"
-                body = (
-                    f"Осталось до начала: <b>{_safe(time_left)}</b>\n\n"
-                    "Как только начнётся война, я буду напоминать тем, кто ещё не атаковал."
-                )
-                fingerprint = f"prep|{context}|{end_time}"
-            elif not missing:
-                header = f"🔔 <b>{context}: всё спокойно</b>"
-                body = (
-                    f"Сейчас: <b>{state_label}</b>\n"
-                    f"Осталось: <b>{_safe(time_left)}</b>\n\n"
-                    "По нашим — все атаки сделаны."
-                )
-                fingerprint = f"ok|{context}|{state}|{end_time}"
-            else:
-                missing_block = "\n".join(
-                    f"{i}. {line}" for i, line in enumerate(missing[:25], start=1)
-                )
-                if len(missing) > 25:
-                    missing_block += f"\n…и ещё <b>{len(missing) - 25}</b>"
-
-                header = f"🔔 <b>{context}: сделайте атаки</b>"
-                body = (
-                    f"Сейчас: <b>{state_label}</b>\n"
-                    f"Осталось: <b>{_safe(time_left)}</b>\n"
-                    f"В списке: <b>{len(missing)}</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "<b>Кому ещё нужно атаковать:</b>\n"
-                    f"{missing_block}"
-                )
-                fingerprint = f"need|{context}|{state}|{end_time}|{';'.join(missing)}"
-
-            text = (
-                f"{header}\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"{body}\n\n"
-                "<i>Это сообщение обновляется само — без спама в чат.</i>"
-            )
-
-            now = time.time()
-            should_send = False
-            if fingerprint != last_fingerprint:
-                should_send = True
-            elif now - last_sent_at >= min_repeat_seconds:
-                should_send = True
-
-            if should_send:
-                msg_id = _notify_message_ids.get(chat_id)
-                if msg_id:
-                    try:
-                        await bot.edit_message_text(
-                            text,
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-                    except Exception:
-                        msg_id = None
-
-                if not msg_id:
-                    sent = await bot.send_message(
-                        chat_id,
-                        text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                        message_thread_id=topic_tid,
-                    )
-                    _notify_message_ids[chat_id] = sent.message_id
-
-                last_fingerprint = fingerprint
-                last_sent_at = now
-
-            await asyncio.sleep(poll_seconds)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("Notify loop error for chat %s: %s", chat_id, exc)
-            await asyncio.sleep(poll_seconds)
-
-
 WEBAPP_DIR = os.path.join(os.path.dirname(__file__), "webapp")
 
 
@@ -3224,6 +3121,15 @@ def _pick_player_public_fields(player: dict) -> dict:
         "league": {"name": str(league.get("name") or "")} if league else {"name": ""},
         "clan": {"name": str(clan.get("name") or ""), "tag": str(clan.get("tag") or "")} if clan else {"name": "", "tag": ""},
     }
+
+
+def _player_in_configured_clan(player: dict | None) -> bool:
+    if not isinstance(player, dict):
+        return False
+    clan = player.get("clan")
+    if not isinstance(clan, dict):
+        return False
+    return _norm_tag(clan.get("tag")) == _norm_tag(CLAN_TAG)
 
 
 async def http_health(_: web.Request) -> web.Response:
@@ -3257,6 +3163,8 @@ async def http_api_lookup(request: web.Request) -> web.Response:
     err = check_api_error(player, context="webapp lookup player")
     if err:
         return _json_error("Не получилось найти игрока. Проверь тег и попробуй ещё раз.", 404)
+    if not _player_in_configured_clan(player):
+        return _json_error("Этот игрок не состоит в нашем клане. Привязать можно только участника клана.", 403)
 
     return web.json_response({"ok": True, "player": _pick_player_public_fields(player or {})})
 
@@ -3266,12 +3174,31 @@ def verify_player_token(player_tag: str, token: str) -> dict | None:
     POST /players/{playerTag}/verifytoken
     Returns dict like {"status":"ok"} or {"status":"invalid"}.
     """
+    global _clash_token
     try:
-        get_clash_token()
+        if not _clash_token:
+            get_clash_token()
         encoded = encode_tag(player_tag)
         url = f"{COC_API_BASE}/players/{encoded}/verifytoken"
-        headers = {"Authorization": f"Bearer {_clash_token}", "Accept": "application/json"}
-        resp = requests.post(url, headers=headers, json={"token": str(token)}, timeout=REQUEST_TIMEOUT)
+        headers = {
+            "Authorization": f"Bearer {_clash_token}",
+            "Accept": "application/json",
+        }
+        resp = requests.post(
+            url,
+            headers=headers,
+            json={"token": str(token)},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code in (401, 403):
+            refresh_token()
+            headers["Authorization"] = f"Bearer {_clash_token}"
+            resp = requests.post(
+                url,
+                headers=headers,
+                json={"token": str(token)},
+                timeout=REQUEST_TIMEOUT,
+            )
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code in (400, 404):
@@ -3302,7 +3229,7 @@ async def http_api_verify(request: web.Request) -> web.Response:
     token = str((payload or {}).get("token") or "").strip()
     if not validate_tag(tag):
         return _json_error("Тег выглядит неверно.", 400)
-    if len(token) < 6:
+    if not (6 <= len(token) <= 32) or not token.isalnum():
         return _json_error("Токен выглядит неверно.", 400)
 
     tag = _norm_tag(tag)
@@ -3321,10 +3248,12 @@ async def http_api_verify(request: web.Request) -> web.Response:
     err = check_api_error(player, context="webapp verify player")
     if err:
         return _json_error("Проверка прошла, но данные игрока сейчас недоступны. Попробуй ещё раз.", 502)
+    if not _player_in_configured_clan(player):
+        return _json_error("Этот игрок не состоит в нашем клане. Привязать можно только участника клана.", 403)
 
     try:
         await _pg_ensure_schema()
-        await _db_upsert_link(
+        link_changed = await _db_upsert_link(
             telegram_user_id=int(user.get("id")),
             coc_tag=tag,
             coc_name=str((player or {}).get("name") or ""),
@@ -3332,19 +3261,27 @@ async def http_api_verify(request: web.Request) -> web.Response:
             tg_first_name=str(user.get("first_name") or ""),
         )
         # Update cache immediately for mentions
-        _links_cache[_norm_tag(tag)] = int(user.get("id"))
-        _tg_links_cache[int(user.get("id"))] = {
+        uid = int(user.get("id"))
+        tag_n = _norm_tag(tag)
+        for cached_tag, cached_uid in list(_links_cache.items()):
+            if int(cached_uid) == uid and cached_tag != tag_n:
+                _links_cache.pop(cached_tag, None)
+        _links_cache[tag_n] = uid
+        _tg_links_cache[uid] = {
             "coc_tag": _norm_tag(tag),
             "coc_name": str((player or {}).get("name") or ""),
             "verified_at": str(datetime.now(timezone.utc).isoformat()),
         }
+    except LinkAlreadyBoundError as exc:
+        logger.warning("DB link conflict for %s: %s", tag, exc)
+        return _json_error(str(exc), 409)
     except Exception as exc:
         logger.error("DB upsert failed: %s", exc)
         return _json_error("Не удалось сохранить привязку. Попробуй ещё раз.", 502)
 
     # Notify clan chat (optional)
     try:
-        if _BOT_INSTANCE and isinstance(CHAT_ID, int) and CHAT_ID != 0:
+        if link_changed and _BOT_INSTANCE and isinstance(CHAT_ID, int) and CHAT_ID != 0:
             tg_name = str(user.get("first_name") or "игрок")
             mention = _mention_html(int(user.get("id")), tg_name)
             coc_name = _safe((player or {}).get("name") or "Игрок")
@@ -3395,7 +3332,8 @@ async def http_api_me(request: web.Request) -> web.Response:
             }
         )
     except Exception as exc:
-        return _json_error(f"Не удалось загрузить данные ({exc})", 502)
+        logger.error("WebApp /api/me failed: %s", exc)
+        return _json_error("Не удалось загрузить данные. Попробуй ещё раз.", 502)
 
 
 async def http_api_unlink(request: web.Request) -> web.Response:
@@ -3418,6 +3356,9 @@ async def http_api_unlink(request: web.Request) -> web.Response:
         pool = await _pg_get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT coc_tag, coc_name FROM coc_links WHERE telegram_user_id=$1", uid)
+            if not row:
+                _tg_links_cache.pop(uid, None)
+                return web.json_response({"ok": True, "linked": False})
             await conn.execute("DELETE FROM coc_links WHERE telegram_user_id=$1", uid)
         # update caches
         try:
@@ -3434,8 +3375,8 @@ async def http_api_unlink(request: web.Request) -> web.Response:
         try:
             if _BOT_INSTANCE and isinstance(CHAT_ID, int) and CHAT_ID != 0:
                 mention = _mention_html(uid, str(user.get("first_name") or "игрок"))
-                coc = _safe(str((row or {}).get("coc_name") or "Игрок"))
-                tag = _safe(str((row or {}).get("coc_tag") or ""))
+                coc = _safe(str(row["coc_name"] or "Игрок"))
+                tag = _safe(str(row["coc_tag"] or ""))
                 await _BOT_INSTANCE.send_message(
                     CHAT_ID,
                     f"ℹ️ {mention} убрал привязку аккаунта: <b>{coc}</b> <code>{tag}</code>",
@@ -3446,7 +3387,7 @@ async def http_api_unlink(request: web.Request) -> web.Response:
         except Exception:
             pass
 
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "linked": True})
     except Exception as exc:
         logger.error("Unlink failed: %s", exc)
         return _json_error("Не удалось удалить привязку. Попробуй ещё раз.", 502)
@@ -3864,8 +3805,6 @@ async def cb_player_stats_pick(query: CallbackQuery) -> None:
     tag_compact = parts[2].strip().upper()
     player_tag = "#" + tag_compact.lstrip("#")
 
-    key = (query.message.chat.id, tag_compact)
-
     status = await query.message.answer("⏳ <b>Готовлю отчёт</b>\n\n|⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛|\n<i>Старт…</i>", parse_mode="HTML")
     try:
         msg_id = await _build_and_send_player_report(
@@ -3875,12 +3814,15 @@ async def cb_player_stats_pick(query: CallbackQuery) -> None:
             reply_to_message=status,
             progress_message=status,
         )
-        await status.delete()
-    except Exception:
-        try:
+        if msg_id:
             await status.delete()
-        except Exception:
-            pass
+    except Exception as exc:
+        logger.warning("Build player stats failed: %s", exc)
+        await status.edit_text(
+            "❌ <b>Не удалось собрать отчёт</b>\n\nПопробуй ещё раз чуть позже.",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 @router_dp.callback_query(F.data.startswith("pstats:refresh:"))
@@ -3915,10 +3857,11 @@ async def cb_player_stats_refresh(query: CallbackQuery) -> None:
     except Exception as exc:
         logger.warning("Refresh player stats failed: %s", exc)
         if status:
-            try:
-                await status.delete()
-            except Exception:
-                pass
+            await status.edit_text(
+                "❌ <b>Не удалось обновить отчёт</b>\n\nПопробуй ещё раз чуть позже.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
 
 
 @router_dp.callback_query(F.data == "menu:notify")
@@ -4351,12 +4294,6 @@ async def handle_reset(message: Message) -> None:
         except Exception:
             pass
     _notify_tasks.clear()
-    for chat_id, task in list(_broadcast_tasks.items()):
-        try:
-            task.cancel()
-        except Exception:
-            pass
-    _broadcast_tasks.clear()
 
     # Reset token cache
     global _clash_token, _clash_token_source
@@ -4752,6 +4689,9 @@ async def handle_raw_tag(message: Message) -> None:
     """
     Если пользователь прислал просто #ТЕГ — автоматически покажем краткую карточку игрока.
     """
+    if not await _ensure_registered_for_message(message):
+        return
+
     raw_tag = message.text.strip().split()[0]
 
     if not validate_tag(raw_tag):
@@ -4759,7 +4699,7 @@ async def handle_raw_tag(message: Message) -> None:
 
     logger.info(
         "User %s sent raw tag %s — auto-looking up player",
-        message.from_user.id,
+        getattr(message.from_user, "id", "—"),
         raw_tag,
     )
 
@@ -4980,12 +4920,6 @@ async def main() -> None:
             except Exception:
                 pass
         _notify_tasks.clear()
-        for chat_id, task in list(_broadcast_tasks.items()):
-            try:
-                task.cancel()
-            except Exception:
-                pass
-        _broadcast_tasks.clear()
 
         try:
             await server_runner.cleanup()
@@ -4993,6 +4927,13 @@ async def main() -> None:
             pass
         try:
             await _release_polling_lock()
+        except Exception:
+            pass
+        try:
+            global _pg_pool
+            if _pg_pool is not None:
+                await _pg_pool.close()
+                _pg_pool = None
         except Exception:
             pass
         await bot.session.close()
