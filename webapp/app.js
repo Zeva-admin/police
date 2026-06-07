@@ -24,6 +24,7 @@
   const tgUserLine  = $("tg-user-line");
   const tagInput    = $("tag-input");
   const tokenInput  = $("token-input");
+  const statusIntro = $("status-intro");
   const statusTag   = $("status-tag");
   const statusToken = $("status-token");
   const playerCard  = $("player-card");
@@ -39,14 +40,6 @@
   const btnChange = $("btn-change");
   const btnUnlink = $("btn-unlink");
 
-  const btnMenu      = $("btn-menu");
-  const drawer       = $("drawer");
-  const backdrop     = $("backdrop");
-  const drawerClose  = $("drawer-close");
-  const drawerMe     = $("drawer-me");
-  const drawerChange = $("drawer-change");
-  const drawerUnlink = $("drawer-unlink");
-
   const loading      = $("loading");
   const loadingTitle = $("loading-title");
   const loadingText  = $("loading-text");
@@ -54,6 +47,7 @@
   let initData    = "";
   let selectedTag = "";
   let lastPlayer  = null;
+  let unlinkBusy  = false;
 
   /* ─── Utils ─── */
   function esc(s) {
@@ -89,17 +83,6 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  /* ─── Sidebar ─── */
-  function openDrawer() {
-    drawer.setAttribute("aria-hidden", "false");
-    document.body.style.overflow = "hidden";
-  }
-
-  function closeDrawer() {
-    drawer.setAttribute("aria-hidden", "true");
-    document.body.style.overflow = "";
-  }
-
   /* ─── Loader ─── */
   function setLoading(on, title, sub) {
     if (!loading) return;
@@ -133,6 +116,9 @@
   /* ─── API ─── */
   async function api(path, payload) {
     try { if (tg) initData = tg.initData || initData; } catch (_) {}
+    if (!initData) {
+      throw new Error("Открой это окно через кнопку в боте и попробуй ещё раз.");
+    }
 
     const labels = {
       "/api/lookup": "Ищу игрока",
@@ -146,8 +132,7 @@
       const res  = await fetch(path, {
         method:  "POST",
         headers: {
-          "Content-Type":         "application/json",
-          "X-Telegram-Init-Data": initData,
+          "Content-Type": "application/json",
         },
         body: JSON.stringify(payload ?? {}),
       });
@@ -203,9 +188,11 @@
   }
 
   /* ─── Confirm ─── */
-  function safeConfirm(msg, cb) {
-    if (tg?.showConfirm) tg.showConfirm(msg, cb);
-    else cb(window.confirm(msg));
+  function confirmAsync(msg) {
+    return new Promise(resolve => {
+      if (tg?.showConfirm) tg.showConfirm(msg, resolve);
+      else resolve(window.confirm(msg));
+    });
   }
 
   /* ─── withBtn ─── */
@@ -221,6 +208,7 @@
   btnStart.addEventListener("click", () => {
     try { if (tg) initData = tg.initData || initData; } catch (_) {}
     fillUser();
+    hideStatus(statusIntro);
     hideStatus(statusTag);
     tagInput.value = "";
     show(stepTag);
@@ -266,8 +254,8 @@
   btnVerify.addEventListener("click", () =>
     withBtn(btnVerify, async () => {
       const token = (tokenInput.value || "").trim();
-      if (token.length < 6) {
-        setStatus(statusToken, "bad", "Токен слишком короткий.");
+      if (!/^[0-9A-Za-z]{6,32}$/.test(token)) {
+        setStatus(statusToken, "bad", "Токен выглядит неверно. Проверь символы и попробуй ещё раз.");
         return;
       }
       setStatus(statusToken, "info", "Проверяю…");
@@ -308,47 +296,30 @@
   });
 
   async function doUnlink() {
-    safeConfirm("Удалить привязку аккаунта?", async confirmed => {
-      if (!confirmed) return;
-      try {
-        await api("/api/unlink", { initData });
-        lastPlayer  = null;
-        selectedTag = "";
-        show(stepIntro);
-        try { if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred("success"); } catch (_) {}
-      } catch (e) {
-        if (tg?.showAlert) tg.showAlert(e.message || "Не удалось удалить привязку.");
-        else alert(e.message || "Не удалось удалить привязку.");
-      }
-    });
+    if (unlinkBusy) return;
+    const confirmed = await confirmAsync("Удалить привязку аккаунта?");
+    if (!confirmed) return;
+
+    unlinkBusy = true;
+    btnUnlink.disabled = true;
+    try {
+      await api("/api/unlink", { initData });
+      lastPlayer  = null;
+      selectedTag = "";
+      hideStatus(statusIntro);
+      show(stepIntro);
+      try { if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred("success"); } catch (_) {}
+    } catch (e) {
+      const msg = e.message || "Не удалось удалить привязку.";
+      if (tg?.showAlert) tg.showAlert(msg);
+      else alert(msg);
+    } finally {
+      unlinkBusy = false;
+      btnUnlink.disabled = false;
+    }
   }
 
   btnUnlink.addEventListener("click", doUnlink);
-
-  /* ─── Sidebar ─── */
-  btnMenu.addEventListener("click", openDrawer);
-  backdrop.addEventListener("click", closeDrawer);
-  drawerClose.addEventListener("click", closeDrawer);
-
-  drawerMe.addEventListener("click", () => {
-    closeDrawer();
-    if (lastPlayer) show(stepDone);
-    else show(stepIntro);
-  });
-
-  drawerChange.addEventListener("click", () => {
-    closeDrawer();
-    tagInput.value = "";
-    hideStatus(statusTag);
-    fillUser();
-    show(stepTag);
-    setTimeout(() => tagInput.focus(), 350);
-  });
-
-  drawerUnlink.addEventListener("click", async () => {
-    closeDrawer();
-    await doUnlink();
-  });
 
   /* ─── Keyboard ─── */
   tagInput.addEventListener("keydown",   e => { if (e.key === "Enter") btnLookup.click(); });
@@ -375,7 +346,14 @@
         doneText.innerHTML = `Привязан аккаунт <strong>${esc(p.name || "игрок")}</strong> <code>${esc(selectedTag)}</code>.`;
         show(stepDone);
       }
-    } catch (_) { /* нет привязки — остаёмся на intro */ }
+    } catch (e) {
+      const msg = e.message || "";
+      if (msg.includes("Открой это окно")) {
+        setStatus(statusIntro, "bad", msg);
+      } else {
+        setStatus(statusIntro, "info", "Не удалось проверить текущую привязку. Можно попробовать начать заново.");
+      }
+    }
   }
 
   boot();
