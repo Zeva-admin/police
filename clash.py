@@ -1562,27 +1562,41 @@ def player_stats_select_text_and_kb(members: list[dict]) -> tuple[str, InlineKey
     """
     One-message full list (up to 50) + digit buttons to pick a player for stats.
     """
+    header = (
+        "📊 <b>Статистика игрока</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Выбери игрока цифрой ниже — я соберу данные и сделаю понятную картинку с оценками.\n\n"
+        "<i>Подсказка: это одно сообщение, без листания страниц.</i>\n\n"
+    )
     lines: list[str] = []
     buttons: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
+    max_text_len = 3800
+
+    def short_raw(value: object, limit: int) -> str:
+        s = str(value or "")
+        if len(s) <= limit:
+            return s
+        return s[: max(0, limit - 1)] + "…"
 
     for idx, m in enumerate([x for x in members if isinstance(x, dict)][:50], start=1):
-        name = _safe(m.get("name", "—"))
+        name = _safe(short_raw(m.get("name", "—"), 18))
         tag = _norm_tag(m.get("tag"))
         trophies = format_number(m.get("trophies"))
-        trophy_league = _safe((m.get("league") or {}).get("name", "—"))
+        trophy_league = _safe(short_raw((m.get("league") or {}).get("name", "—"), 24))
         role = m.get("role", "member")
         role_label = get_role_label(role)
         role_emoji = get_role_emoji(role)
 
-        # Keep the list readable and under Telegram limits
-        if len(name) > 18:
-            name = name[:17] + "…"
-
-        lines.append(
+        line = (
             f"{idx}. {role_emoji} <b>{name}</b> — 🏆 {trophies} • {trophy_league} • {role_label}\n"
             f"    <code>{_safe(tag)}</code>"
         )
+        next_lines = lines + [line]
+        if len(header + "\n\n".join(next_lines)) > max_text_len:
+            break
+
+        lines.append(line)
 
         tag_compact = tag.lstrip("#")
         row.append(InlineKeyboardButton(text=str(idx), callback_data=f"pstats:pick:{tag_compact}"))
@@ -1596,16 +1610,9 @@ def player_stats_select_text_and_kb(members: list[dict]) -> tuple[str, InlineKey
     buttons.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    text = (
-        "📊 <b>Статистика игрока</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Выбери игрока цифрой ниже — я соберу данные и сделаю понятную картинку с оценками.\n\n"
-        "<i>Подсказка: это одно сообщение, без листания страниц.</i>\n\n"
-        + "\n\n".join(lines)
-    )
-    # Telegram message limit safety
-    if len(text) > 3900:
-        text = text[:3899] + "…"
+    text = header + ("\n\n".join(lines) if lines else "<i>Нет участников для выбора.</i>")
+    if len(lines) < len([x for x in members if isinstance(x, dict)][:50]):
+        text += f"\n\n<i>Показаны первые {len(lines)} игроков, чтобы сообщение поместилось в Telegram.</i>"
     return text, kb
 
 
@@ -3733,12 +3740,13 @@ async def cb_find(query: CallbackQuery) -> None:
     if not await _ensure_registered_for_query(query):
         return
     text = (
-        "🔎 <b>Поиск по участникам</b>\n"
+        "🔎 <b>Поиск игроков</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Напиши команду:\n"
-        "<code>/find часть_ника</code>\n\n"
+        "<code>/find #тег</code> — глобальный поиск\n"
+        "<code>/find часть_ника</code> — поиск по клану\n\n"
         "Пример:\n"
-        "<code>/find andr</code>"
+        "<code>/find #QV8CUPJ92</code>"
     )
     await _edit_or_send(query.message, text, main_menu_keyboard(2))
 
@@ -4380,7 +4388,7 @@ async def handle_threadid(message: Message) -> None:
 
 @router_dp.message(Command("find", ignore_mention=True))
 async def handle_find(message: Message) -> None:
-    """Поиск по участникам клана по нику/тегу."""
+    """Глобальный поиск по тегу или поиск по участникам клана по нику."""
     if not await _ensure_registered_for_message(message):
         return
     parts = (message.text or "").split(maxsplit=1)
@@ -4390,15 +4398,41 @@ async def handle_find(message: Message) -> None:
             "🔎 <b>Поиск</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "Напиши:\n"
-            "<code>/find часть_ника</code>\n\n"
+            "<code>/find #тег</code> — глобально\n"
+            "<code>/find часть_ника</code> — по клану\n\n"
             "Пример:\n"
-            "<code>/find andr</code>",
+            "<code>/find #QV8CUPJ92</code>",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard(2),
         )
         return
 
     query = parts[1].strip()
+    first_arg = query.split()[0]
+    if validate_tag(first_arg):
+        data = await _api(get_player_info, first_arg)
+        err = check_api_error(data, context=f"global player find {first_arg}")
+        if err:
+            await _answer_in_thread(message, err, parse_mode="HTML", reply_markup=main_menu_keyboard(2))
+            return
+
+        tag_no_hash = _norm_tag((data or {}).get("tag")).lstrip("#")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="👤 Открыть профиль", callback_data=f"menu:member:1:{tag_no_hash}")],
+                [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")],
+            ]
+        )
+        await _answer_in_thread(
+            message,
+            "🔎 <b>Глобальный поиск</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            + build_player_text(data),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+
     data = await _api(get_clan_members, CLAN_TAG)
     err = check_api_error(data, context="find members")
     if err:
