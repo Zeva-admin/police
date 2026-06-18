@@ -1089,6 +1089,16 @@ async def _pg_ensure_schema() -> None:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS coc_links_coc_tag_uidx
               ON coc_links (coc_tag);
+
+            CREATE TABLE IF NOT EXISTS group_nicks (
+              chat_id BIGINT NOT NULL,
+              telegram_user_id BIGINT NOT NULL,
+              tg_name TEXT NOT NULL DEFAULT '',
+              game_nick TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (chat_id, telegram_user_id)
+            );
             """
         )
 
@@ -1206,6 +1216,121 @@ async def get_user_link(telegram_user_id: int) -> dict | None:
         return None
     await _refresh_tg_links_cache()
     return _tg_links_cache.get(int(telegram_user_id))
+
+
+def _is_group_chat(message: Message) -> bool:
+    return str(getattr(message.chat, "type", "") or "").lower() in {"group", "supergroup"}
+
+
+def _telegram_name_for_storage(user: object) -> str:
+    first = str(getattr(user, "first_name", "") or "").strip()
+    last = str(getattr(user, "last_name", "") or "").strip()
+    full = " ".join(part for part in (first, last) if part).strip()
+    if full:
+        return full
+    username = str(getattr(user, "username", "") or "").strip()
+    if username:
+        return f"@{username.lstrip('@')}"
+    return "пользователь"
+
+
+def _parse_game_nick_command(text: str | None) -> str | None:
+    raw = str(text or "").strip()
+    if not raw.startswith("+"):
+        return None
+    body = raw[1:].strip()
+    if not body:
+        return ""
+    parts = body.split(maxsplit=1)
+    if parts and parts[0].strip().lower() == "ник":
+        return parts[1].strip() if len(parts) > 1 else ""
+    return body
+
+
+def _validate_game_nick(nick: str) -> str | None:
+    if not nick:
+        return "Напиши ник после плюса. Пример: <code>+aboo</code> или <code>+ник aboo</code>."
+    if any(ch in nick for ch in ("\n", "\r", "\t")):
+        return "Ник должен быть в одну строку. Пример: <code>+aboo</code>."
+    if len(nick) > 32:
+        return "Ник слишком длинный. Сделай до 32 символов."
+    return None
+
+
+def group_nick_welcome_text(user: object) -> str:
+    who = _tg_user_display(user) if user is not None else "<b>новичок</b>"
+    return (
+        f"👋 {who}, добро пожаловать!\n\n"
+        "Запиши своё игровое имя в чате, чтобы ребята понимали, кто ты в игре.\n"
+        "Примеры:\n"
+        "<code>+aboo</code>\n"
+        "<code>+ник aboo</code>\n\n"
+        "Список записанных имён можно посмотреть командой <code>ники</code>."
+    )
+
+
+async def _db_upsert_group_nick(
+    *,
+    chat_id: int,
+    telegram_user_id: int,
+    tg_name: str,
+    game_nick: str,
+) -> tuple[bool, bool]:
+    await _pg_ensure_schema()
+    pool = await _pg_get_pool()
+    cid = int(chat_id)
+    uid = int(telegram_user_id)
+    nick = str(game_nick or "").strip()
+    async with pool.acquire() as conn:
+        current = await conn.fetchrow(
+            "SELECT game_nick FROM group_nicks WHERE chat_id=$1 AND telegram_user_id=$2",
+            cid,
+            uid,
+        )
+        await conn.execute(
+            """
+            INSERT INTO group_nicks (chat_id, telegram_user_id, tg_name, game_nick, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, NOW(), NOW())
+            ON CONFLICT (chat_id, telegram_user_id) DO UPDATE
+            SET tg_name = EXCLUDED.tg_name,
+                game_nick = EXCLUDED.game_nick,
+                updated_at = NOW();
+            """,
+            cid,
+            uid,
+            str(tg_name or ""),
+            nick,
+        )
+        existed = current is not None
+        changed = existed and str(current["game_nick"] or "") != nick
+        return existed, changed
+
+
+async def _db_get_group_nicks(chat_id: int) -> list[dict]:
+    await _pg_ensure_schema()
+    pool = await _pg_get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT telegram_user_id, tg_name, game_nick, created_at, updated_at
+            FROM group_nicks
+            WHERE chat_id=$1
+            ORDER BY lower(tg_name), updated_at DESC
+            """,
+            int(chat_id),
+        )
+    result: list[dict] = []
+    for row in rows:
+        result.append(
+            {
+                "telegram_user_id": int(row["telegram_user_id"]),
+                "tg_name": str(row["tg_name"] or ""),
+                "game_nick": str(row["game_nick"] or ""),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+    return result
 
 
 def registration_prompt_text(user) -> str:
@@ -3533,8 +3658,8 @@ async def cb_webapp_info(query: CallbackQuery) -> None:
     text = (
         "✅ <b>Регистрация</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Мини‑приложение открывается только по <b>HTTPS</b>.\n\n"
-        "Если ты запускаешь бота локально — разверни его на Render (или используй HTTPS‑туннель) и открой кнопку снова."
+        "Ошибка миним приложения обратитесь к <b>aboo</b>.\n\n"
+        "Но сначало подождите минут 5-10 возможно сревер Clash не отвечает на запросы.\n\n"
     )
     await _edit_or_send(query.message, text, main_menu_keyboard())
 
@@ -4716,6 +4841,129 @@ async def handle_donations(message: Message) -> None:
     )
 
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+
+@router_dp.message(F.new_chat_members)
+async def handle_new_chat_members(message: Message) -> None:
+    """Show nickname registration rules when a new user joins a group."""
+    if not _is_group_chat(message):
+        return
+    members = getattr(message, "new_chat_members", None) or []
+    for member in members:
+        try:
+            if bool(getattr(member, "is_bot", False)):
+                continue
+            await _answer_in_thread(
+                message,
+                group_nick_welcome_text(member),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            logger.warning("Failed to send group nick welcome: %s", exc)
+
+
+@router_dp.message(F.text.startswith("+"))
+async def handle_group_nick_set(message: Message) -> None:
+    """Save or update a user's in-game nickname for the current group."""
+    if not _is_group_chat(message):
+        await message.answer(
+            "Эта команда работает в группе. Там напиши <code>+aboo</code> или <code>+ник aboo</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    nick = _parse_game_nick_command(message.text)
+    if nick is None:
+        return
+    error = _validate_game_nick(nick)
+    if error:
+        await _answer_in_thread(message, f"❗ {error}", parse_mode="HTML")
+        return
+
+    try:
+        uid = int(message.from_user.id) if message.from_user else 0
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        await _answer_in_thread(
+            message,
+            "⚠️ Не вижу, кто отправил сообщение. Напиши ник от своего Telegram-аккаунта.",
+            parse_mode="HTML",
+        )
+        return
+
+    tg_name = _telegram_name_for_storage(message.from_user)
+    try:
+        existed, changed = await _db_upsert_group_nick(
+            chat_id=int(message.chat.id),
+            telegram_user_id=uid,
+            tg_name=tg_name,
+            game_nick=nick,
+        )
+    except Exception as exc:
+        logger.error("Failed to save group nick for user %s in chat %s: %s", uid, message.chat.id, exc)
+        await _answer_in_thread(
+            message,
+            "⚠️ Список ников временно недоступен. Попробуй ещё раз чуть позже.",
+            parse_mode="HTML",
+        )
+        return
+
+    action = "обновлено" if existed and changed else ("уже записано" if existed else "записано")
+    await _answer_in_thread(
+        message,
+        f"✅ Игровое имя {action}: <b>{_safe(nick)}</b>",
+        parse_mode="HTML",
+    )
+
+
+@router_dp.message(lambda message: isinstance(getattr(message, "text", None), str) and message.text.strip().lower() == "ники")
+async def handle_group_nicks_list(message: Message) -> None:
+    """Show saved in-game nicknames for the current group."""
+    if not _is_group_chat(message):
+        await message.answer(
+            "Команда <code>ники</code> работает в группе и показывает список игровых имён этого чата.",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        rows = await _db_get_group_nicks(int(message.chat.id))
+    except Exception as exc:
+        logger.error("Failed to load group nicks for chat %s: %s", message.chat.id, exc)
+        await _answer_in_thread(
+            message,
+            "⚠️ Список ников временно недоступен. Попробуй ещё раз чуть позже.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not rows:
+        await _answer_in_thread(
+            message,
+            "📋 <b>Ники игроков</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Пока никто не записался.\n"
+            "Пример: <code>+aboo</code> или <code>+ник aboo</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    lines: list[str] = []
+    for idx, row in enumerate(rows, start=1):
+        uid = int(row.get("telegram_user_id") or 0)
+        tg_name = str(row.get("tg_name") or "пользователь")
+        game_nick = str(row.get("game_nick") or "—")
+        tg_display = _mention_html(uid, tg_name) if uid > 0 else f"<b>{_safe(tg_name)}</b>"
+        lines.append(f"{idx}. {tg_display} → <b>{_safe(game_nick)}</b>")
+
+    text = (
+        "📋 <b>Ники игроков</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "\n".join(lines)
+    )
+    await _answer_in_thread(message, text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @router_dp.message(F.text.startswith("#") & ~F.text.startswith("#!"))
