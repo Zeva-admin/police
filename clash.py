@@ -1247,6 +1247,13 @@ def _parse_game_nick_command(text: str | None) -> str | None:
     return body
 
 
+def _parse_admin_reply_nick_command(text: str | None) -> str | None:
+    raw = str(text or "").strip()
+    if not raw.lower().startswith("это "):
+        return None
+    return raw[4:].strip()
+
+
 def _validate_game_nick(nick: str) -> str | None:
     if not nick:
         return "Напиши ник после плюса. Пример: <code>+aboo</code> или <code>+ник aboo</code>."
@@ -4861,6 +4868,62 @@ async def handle_new_chat_members(message: Message) -> None:
             )
         except Exception as exc:
             logger.warning("Failed to send group nick welcome: %s", exc)
+
+
+@router_dp.message(lambda message: isinstance(getattr(message, "text", None), str) and message.text.strip().lower().startswith("это "))
+async def handle_admin_reply_nick_set(message: Message) -> None:
+    """Hidden owner-only reply command for assigning a group nickname to another user."""
+    if not _is_group_chat(message) or not _is_owner(message):
+        return
+
+    replied = getattr(message, "reply_to_message", None)
+    target_user = getattr(replied, "from_user", None) if replied else None
+    if not target_user or bool(getattr(target_user, "is_bot", False)):
+        return
+
+    nick = _parse_admin_reply_nick_command(message.text)
+    if nick is None:
+        return
+    error = _validate_game_nick(nick)
+    if error:
+        await _answer_in_thread(message, f"❗ {error}", parse_mode="HTML")
+        return
+
+    try:
+        target_uid = int(target_user.id)
+    except Exception:
+        target_uid = 0
+    if target_uid <= 0:
+        return
+
+    try:
+        existed, changed = await _db_upsert_group_nick(
+            chat_id=int(message.chat.id),
+            telegram_user_id=target_uid,
+            tg_name=_telegram_name_for_storage(target_user),
+            game_nick=nick,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to save admin group nick for user %s in chat %s: %s",
+            target_uid,
+            message.chat.id,
+            exc,
+        )
+        await _answer_in_thread(
+            message,
+            "⚠️ Список ников временно недоступен. Попробуй ещё раз чуть позже.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not existed:
+        text = "✅ Имя добавлено."
+    elif changed:
+        text = "✅ Имя изменено."
+    else:
+        text = "✅ Имя уже записано."
+    await _answer_in_thread(message, text, parse_mode="HTML")
 
 
 @router_dp.message(F.text.startswith("+"))
