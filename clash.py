@@ -143,6 +143,9 @@ _notify_tasks: dict[int, asyncio.Task] = {}
 _broadcast_sent: dict[str, dict[str, float]] = {}  # kept for backward compatibility (no longer used heavily)
 
 SHUTDOWN_EVENT = asyncio.Event()
+# Set only by the owner-only /reset command.  The main coroutine then closes every
+# resource in its normal finally block before Render starts a fresh process.
+_restart_requested = False
 
 # ============================================================
 # SECTION: LOGGING
@@ -1563,13 +1566,9 @@ def build_home_text() -> str:
     real_name = (_CLAN_NAME_CACHED or "").strip()
     clan_title = _safe(display or real_name or "Клан")
 
-    extra = ""
-    if display and real_name and real_name.lower() != display.lower():
-        extra = f"\n<i>{_safe(real_name)}</i>"
-
     return (
         "Привет! 👋\n"
-        f"Рад видеть тебя в меню клана <b>{clan_title}</b>.{extra}\n"
+        f"Рад видеть тебя в меню клана <b>{clan_title}</b>.\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Тег клана: <code>{_safe(CLAN_TAG)}</code>\n\n"
         "Выбирай раздел кнопками — всё обновляется прямо здесь, без лишних сообщений."
@@ -1841,15 +1840,15 @@ def render_player_report_image(
     track = (34, 44, 60)
 
     img = Image.new("RGB", (width, height), bg)
-    # Subtle vertical gradient for a more "pro" look
-    px = img.load()
+    # Drawing 720 horizontal lines is much faster than assigning all 864,000
+    # pixels in Python one at a time, while producing the same gradient.
+    gradient = ImageDraw.Draw(img)
     for y in range(height):
         t = y / max(1, height - 1)
         r = int(bg[0] * (1 - t) + 16 * t)
         g = int(bg[1] * (1 - t) + 18 * t)
         b = int(bg[2] * (1 - t) + 24 * t)
-        for x in range(width):
-            px[x, y] = (r, g, b)
+        gradient.line((0, y, width - 1, y), fill=(r, g, b))
 
     draw = ImageDraw.Draw(img)
 
@@ -2385,11 +2384,20 @@ async def _build_and_send_player_report(
             await _edit_or_send(target_message, err, main_menu_keyboard())
         return None
 
-    await _progress(1, total_steps, "Проверяю клан…")
-    await asyncio.sleep(2.5)
+    # These three API calls do not depend on one another.  Starting them
+    # together removes the intentionally added 7.8-second wait from report
+    # creation and makes the perceived progress reflect real work.
+    await _progress(1, total_steps, "Собираю данные клана, столицы и ЛВК…")
+    members_task = asyncio.create_task(_api(get_clan_members, CLAN_TAG))
+    raids_task = asyncio.create_task(_api(get_capital_raid_seasons, 10))
+    cwl_task = asyncio.create_task(asyncio.to_thread(_get_cwl_wars_for_clan))
+    results = await asyncio.gather(members_task, raids_task, cwl_task, return_exceptions=True)
+    members_data = results[0] if isinstance(results[0], dict) else None
+    raids = results[1] if isinstance(results[1], dict) else None
+    cwl_wars = results[2] if isinstance(results[2], list) else []
 
+    await _progress(2, total_steps, "Сверяю участника клана…")
     # Clan members to get role/name consistency
-    members_data = await _api(get_clan_members, CLAN_TAG)
     members_err = check_api_error(members_data, context="player stats clan members")
     members = (members_data or {}).get("items", []) if isinstance(members_data, dict) else []
     member = None
@@ -2399,20 +2407,14 @@ async def _build_and_send_player_report(
                 member = m
                 break
 
-    await _progress(2, total_steps, "Собираю данные по столице…")
-    await asyncio.sleep(2.5)
-    raids = await _api(get_capital_raid_seasons, 10)
+    await _progress(3, total_steps, "Считаю столицу и ЛВК…")
     raids_err = check_api_error(raids, context="player stats capital raids")
     if raids_err:
         raids = None
 
-    await _progress(3, total_steps, "Собираю историю войн…")
-    await asyncio.sleep(2.5)
-    cwl_wars = await asyncio.to_thread(_get_cwl_wars_for_clan)
     cwl_stats = _cwl_player_stats(cwl_wars, tag)
 
     await _progress(4, total_steps, "Считаю оценки…")
-    await asyncio.sleep(0.3)
     scores, context_label = _compute_player_scores(player or {}, member, raids, cwl_stats)
 
     # Header
@@ -3014,6 +3016,101 @@ def _format_missing_block(missing: list[str], limit: int = 20) -> str:
     return "Кому ещё нужно атаковать:\n" + block
 
 
+def build_war_end_text(war: dict, *, kind: str) -> str:
+    """Create a readable final result for both regular wars and CWL wars."""
+    our, opp = _war_sides(war, CLAN_TAG)
+    result = _war_result_label(our, opp)
+    our_name = _safe(our.get("name") or CLAN_DISPLAY_NAME or "Наш клан")
+    opp_name = _safe(opp.get("name") or "Соперник")
+    our_stars = int(our.get("stars", 0) or 0)
+    opp_stars = int(opp.get("stars", 0) or 0)
+    our_destr = float(our.get("destructionPercentage", 0.0) or 0.0)
+    opp_destr = float(opp.get("destructionPercentage", 0.0) or 0.0)
+    attacks_per_member = 1 if kind == "ЛВК" else int(war.get("attacksPerMember", 2) or 2)
+    team_size = int(war.get("teamSize", 0) or 0)
+    total_attacks = team_size * attacks_per_member if team_size else 0
+
+    our_members = [m for m in (our.get("members") or []) if isinstance(m, dict)]
+    opp_members = [m for m in (opp.get("members") or []) if isinstance(m, dict)]
+    opp_by_tag = {_norm_tag(m.get("tag")): m for m in opp_members}
+    used_attacks = sum(len(m.get("attacks", []) or []) for m in our_members)
+    no_attack: list[str] = []
+    attack_lines: list[str] = []
+
+    for member in our_members:
+        raw_name = str(member.get("name") or "—")
+        name = _maybe_mention_player(raw_name, member.get("tag"))
+        attacks = [a for a in (member.get("attacks") or []) if isinstance(a, dict)]
+        if not attacks:
+            no_attack.append(name)
+            continue
+
+        hits: list[str] = []
+        stars_total = 0
+        destruction_total = 0.0
+        for attack in attacks:
+            stars = int(attack.get("stars", 0) or 0)
+            destruction = float(attack.get("destructionPercentage", 0) or 0)
+            stars_total += stars
+            destruction_total += destruction
+            defender = opp_by_tag.get(_norm_tag(attack.get("defenderTag"))) or {}
+            target_name = _safe(defender.get("name") or attack.get("defenderTag") or "цель")
+            target_pos = defender.get("mapPosition", "?")
+            hits.append(f"#{target_pos} {target_name}: ⭐{stars} • 💥{destruction:.0f}%")
+
+        attack_lines.append(
+            f"• {name} — <b>{len(attacks)}/{attacks_per_member}</b> атак "
+            f"• ⭐<b>{stars_total}</b> • 💥<b>{destruction_total:.0f}%</b>\n"
+            f"  {'; '.join(hits)}"
+        )
+
+    result_icon = {"Победа": "🏆", "Поражение": "💢", "Ничья": "🤝"}.get(result, "🏁")
+    text = (
+        f"🏁 <b>{kind} завершилась</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{result_icon} Итог: <b>{result}</b>\n\n"
+        "⭐ <b>Звёзды</b>\n"
+        f"<b>{our_name}</b> — <b>{our_stars}</b>\n"
+        f"<b>{opp_name}</b> — <b>{opp_stars}</b>\n\n"
+        "💥 <b>Разрушение</b>\n"
+        f"<b>{our_name}</b> — <b>{our_destr:.2f}%</b>\n"
+        f"<b>{opp_name}</b> — <b>{opp_destr:.2f}%</b>\n\n"
+        f"🎯 <b>Использовано атак:</b> <b>{used_attacks}/{total_attacks or '—'}</b>"
+    )
+
+    if no_attack:
+        no_attack_lines: list[str] = []
+        for name in no_attack:
+            candidate = f"• {name}"
+            # Reserve enough room for actual attack results below.  This also
+            # keeps an unusually long roster within Telegram's 4096 limit.
+            if sum(len(line) + 1 for line in no_attack_lines) + len(candidate) > 1500:
+                break
+            no_attack_lines.append(candidate)
+        text += "\n\n🚫 <b>Без атак:</b>\n" + "\n".join(no_attack_lines)
+        if len(no_attack_lines) < len(no_attack):
+            text += f"\n… и ещё <b>{len(no_attack) - len(no_attack_lines)}</b>."
+    else:
+        text += "\n\n✅ <b>Все участники атаковали.</b>"
+
+    if not attack_lines:
+        return text
+
+    text += "\n\n⚔️ <b>Результаты атак:</b>"
+    # Telegram limits messages to 4096 characters.  Keep the critical result
+    # and the complete "без атак" list, then add as many detailed attacks as fit.
+    shown = 0
+    for line in attack_lines:
+        candidate = f"\n{line}"
+        if len(text) + len(candidate) > 3850:
+            break
+        text += candidate
+        shown += 1
+    if shown < len(attack_lines):
+        text += f"\n… подробности показаны для {shown} из {len(attack_lines)} атаковавших."
+    return text
+
+
 async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
     """
     Auto broadcasts war/CWL milestone notifications as NEW messages (no spam):
@@ -3211,18 +3308,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                         fw = await asyncio.to_thread(get_cwl_war, active_war_tag)
                         if isinstance(fw, dict) and not fw.get("_error"):
                             final_war = fw
-                    our_f, opp_f = _war_sides(final_war or {}, CLAN_TAG)
-                    result = _war_result_label(our_f, opp_f)
-                    our_stars = int(our_f.get("stars", 0) or 0)
-                    opp_stars = int(opp_f.get("stars", 0) or 0)
-                    our_d = float(our_f.get("destructionPercentage", 0.0) or 0.0)
-                    opp_d = float(opp_f.get("destructionPercentage", 0.0) or 0.0)
-                    text = (
-                        f"🏁 <b>{kind} завершилась</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"Итог: <b>{result}</b>\n"
-                        f"Счёт: ⭐ <b>{our_stars}</b>:<b>{opp_stars}</b> • 💥 <b>{our_d:.2f}%</b>:<b>{opp_d:.2f}%</b>"
-                    )
+                    text = build_war_end_text(final_war or {}, kind=kind)
                     await _send(text)
                     sent.add("end")
                     if active_id:
@@ -4412,12 +4498,7 @@ async def handle_json(message: Message) -> None:
 
 @router_dp.message(Command("reset", ignore_mention=True))
 async def handle_reset(message: Message) -> None:
-    """
-    Emergency reset for API issues:
-    - cancels notification tasks
-    - clears cached API token
-    - re-authenticates and verifies API access
-    """
+    """Owner-only, graceful full process restart for Render."""
     if not _is_owner(message):
         await message.answer(
             "⛔ <b>Нет доступа</b>\n\nЭта команда доступна только владельцу бота.",
@@ -4425,57 +4506,30 @@ async def handle_reset(message: Message) -> None:
         )
         return
 
-    status = await message.answer("♻️ <i>Перезапускаю соединение...</i>", parse_mode="HTML")
+    await message.answer(
+        "♻️ <b>Запускаю полный безопасный перезапуск.</b>\n\n"
+        "Бот закроет polling, веб-сервер, фоновые задачи и соединение с БД, "
+        "после чего Render автоматически поднимет чистый процесс. "
+        "Привязки и настройки в базе не затрагиваются.",
+        parse_mode="HTML",
+    )
+    asyncio.create_task(_request_safe_restart())
 
-    # Stop notification loops (they will be restarted manually by pressing the button again)
-    for chat_id, task in list(_notify_tasks.items()):
-        try:
-            task.cancel()
-        except Exception:
-            pass
-    _notify_tasks.clear()
 
-    # Reset token cache
-    global _clash_token, _clash_token_source
-    _clash_token = ""
-    _clash_token_source = "unset"
-
+async def _request_safe_restart() -> None:
+    """Let the active update finish, then enter main()'s graceful cleanup path."""
+    global _restart_requested
+    await asyncio.sleep(1)
+    _restart_requested = True
+    logger.warning("Full restart requested by owner; stopping polling gracefully.")
+    SHUTDOWN_EVENT.set()
     try:
-        await _api(get_clash_token)
-        clan = await _api(get_clan_info, CLAN_TAG)
-        err = check_api_error(clan, context="reset verify clan")
-        if err:
-            await status.edit_text(
-                "⚠️ <b>Соединение обновлено</b>, но сейчас данные недоступны.\n\n"
-                + err
-                + "\n\n<i>Обычно помогает просто подождать 1–2 минуты и попробовать снова.</i>",
-                parse_mode="HTML",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-
-        cname = _safe((clan or {}).get("name", "—"))
-        global _CLAN_NAME_CACHED
-        if cname and cname != "—":
-            _CLAN_NAME_CACHED = cname
-        await status.edit_text(
-            "✅ <b>Готово</b>\n"
-            "\n"
-            "Соединение обновлено. Уведомления остановлены.\n"
-            f"Клан: <b>{cname}</b> <code>{_safe(CLAN_TAG)}</code>.",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
-        )
+        await router_dp.stop_polling()
+    except RuntimeError:
+        # Polling may already be stopping because of a deploy or a network error.
+        pass
     except Exception as exc:
-        logger.error("Reset failed: %s", exc)
-        await status.edit_text(
-            "❌ <b>Reset не удался</b>\n"
-            "\n"
-            "Не получилось обновить соединение.\n"
-            "<i>Попробуй ещё раз через минуту.</i>",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
-        )
+        logger.warning("Could not stop polling cleanly during restart: %s", exc)
 
 
 @router_dp.message(Command("chatid", ignore_mention=True))
@@ -5218,7 +5272,9 @@ async def main() -> None:
 
         # Ensure no webhook is set (polling only)
         try:
-            await bot.delete_webhook(drop_pending_updates=True)
+            # Do not discard commands while Render replaces an instance during a
+            # deploy or after /reset.  The advisory lock prevents two pollers.
+            await bot.delete_webhook(drop_pending_updates=False)
         except Exception:
             pass
 
@@ -5230,7 +5286,7 @@ async def main() -> None:
                 await dp.start_polling(
                     bot,
                     allowed_updates=["message", "callback_query"],
-                    drop_pending_updates=True,
+                    drop_pending_updates=False,
                 )
                 if not SHUTDOWN_EVENT.is_set():
                     logger.warning("Polling завершился. Перезапуск через 3 секунды...")
@@ -5283,6 +5339,11 @@ async def main() -> None:
             pass
         await bot.session.close()
         logger.info("Bot session closed.")
+        if _restart_requested:
+            # A non-zero exit tells Render to create a new process.  This is
+            # deliberately after server, DB, lock and Telegram cleanup.
+            logger.warning("Graceful cleanup completed; exiting for Render restart.")
+            raise SystemExit(75)
 
 
 if __name__ == "__main__":
