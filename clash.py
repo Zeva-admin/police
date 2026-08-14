@@ -10,6 +10,7 @@ import time
 import hmac
 import hashlib
 import urllib.parse
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from urllib.parse import quote
@@ -30,6 +31,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    ChatMemberUpdated,
     Message,
     ReplyKeyboardRemove,
     WebAppInfo,
@@ -83,19 +85,10 @@ _CLAN_NAME_CACHED: str | None = None
 _CLAN_WARLEAGUE_CACHED: str | None = None
 
 OWNER_USER_ID: int = 7053001262
-CHAT_ID: int = -1002552886756
-
-# For groups with Topics enabled (forum supergroups):
-# - If you want bot background messages (broadcasts/announcements) to land in a specific topic,
-#   set the corresponding thread id here.
-# - Replies to user commands are sent to the same topic automatically.
+CHAT_ID: int = -1002552886756                                                                      
 CHAT_MAIN_THREAD_ID: int = 0
-CHAT_ADMIN_THREAD_ID: int = 0
-
-# Supabase (Postgres) connection string.
-DATABASE_URL: str = (os.environ.get("DATABASE_URL") or "").strip()
-
-# Public base URL for Telegram Mini App (must be HTTPS for Telegram Web Apps)
+CHAT_ADMIN_THREAD_ID: int = 0                                    
+DATABASE_URL: str = (os.environ.get("DATABASE_URL") or "").strip()                                                                             
 _RENDER_EXTERNAL_URL = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
 _RENDER_EXTERNAL_HOSTNAME = (os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "").strip()
 _PUBLIC_BASE_URL_ENV = (os.environ.get("PUBLIC_BASE_URL") or "").strip()
@@ -107,69 +100,49 @@ PUBLIC_BASE_URL: str = (
 )
 
 _pg_pool: object | None = None
-_links_cache: dict[str, int] = {}  # COC_TAG -> telegram_user_id
+_links_cache: dict[str, int] = {}                               
 _links_cache_loaded_at: float = 0.0
-LINKS_CACHE_TTL_SECONDS: int = 300  # 5 minutes
-_tg_links_cache: dict[int, dict] = {}  # telegram_user_id -> {coc_tag, coc_name, verified_at}
-_tg_links_cache_loaded_at: float = 0.0
-
-# Bot instance for WebApp handlers (set in main)
+LINKS_CACHE_TTL_SECONDS: int = 300             
+_tg_links_cache: dict[int, dict] = {}                                                        
+_tg_links_cache_loaded_at: float = 0.0                                        
 _BOT_INSTANCE: Bot | None = None
 _BOT_USERNAME: str = ""
-
-# Render deploy overlap guard:
-# When two instances start at the same time, Telegram polling conflicts.
-# If Postgres (Supabase) is available, we use a session-level advisory lock so that
-# only one instance performs polling at a time.
-_poll_lock_conn: object | None = None
-
-# Local time formatting for UI (UTC offset). Ashgabat is UTC+5.
+_poll_lock_conn: object | None = None                       
 LOCAL_UTC_OFFSET_HOURS: int = 5
 LOCAL_TZ = timezone(timedelta(hours=LOCAL_UTC_OFFSET_HOURS))
-
-# API settings
 COC_API_BASE: str = "https://api.clashofclans.com/v1"
 REQUEST_TIMEOUT: int = 10
 TOKEN_RETRY_ATTEMPTS: int = 3
-TOKEN_RETRY_DELAY: int = 10
-
-# Global token storage
+TOKEN_RETRY_DELAY: int = 10   
 _clash_token: str = ""
-_clash_token_source: str = "unset"  # "clashapi" | "unset"
-
-# Notification tasks per chat (group/supergroup)
+_clash_token_source: str = "unset"                        
 _notify_tasks: dict[int, asyncio.Task] = {}
-
-_broadcast_sent: dict[str, dict[str, float]] = {}  # kept for backward compatibility (no longer used heavily)
-
+_broadcast_sent: dict[str, dict[str, float]] = {}                                                            
 SHUTDOWN_EVENT = asyncio.Event()
-# Set only by the owner-only /reset command.  The main coroutine then closes every
-# resource in its normal finally block before Render starts a fresh process.
 _restart_requested = False
-
-# ============================================================
-# SECTION: LOGGING
-# ============================================================
-
+PROCESS_STARTED_AT = time.monotonic()
+HEAVY_REQUEST_LIMIT = 5
+HEAVY_REQUEST_WINDOW_SECONDS = 60
+_heavy_request_times: dict[int, deque[float]] = defaultdict(deque)
+WAR_NOTIFICATION_MAX_ATTEMPTS = 10
+WAR_NOTIFICATION_LEASE_SECONDS = 120
+_startup_ready = False
+_startup_error = "starting"
+_bot_connected = False
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, (os.environ.get("LOG_LEVEL") or "INFO").upper(), logging.INFO),
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
     ],
 )
-
 logger = logging.getLogger("coc_bot")
-
-
 def miniapp_url() -> str:
     base = (PUBLIC_BASE_URL or "").strip().rstrip("/")
     if not base:
         base = "http://localhost:10000"
     return f"{base}/webapp"
-
-
 def miniapp_https_url() -> str | None:
     """
     Telegram Web Apps require HTTPS URLs.
@@ -179,18 +152,10 @@ def miniapp_https_url() -> str | None:
     if url.lower().startswith("https://"):
         return url
     return None
-
-# ============================================================
-# SECTION: CLASH TOKEN MANAGER
-# ============================================================
-
-
 DEVPORTAL_BASE: str = "https://developer.clashofclans.com"
 DEVPORTAL_SCOPE: str = "clash"
 DEVPORTAL_KEY_NAME: str = "coc-telegram-bot"
 DEVPORTAL_KEY_DESCRIPTION: str = "Auto-generated by telegram bot (clash.py)"
-
-
 def _decode_jwt_payload(jwt_token: str) -> dict:
     """
     Decode the payload part of a JWT without verifying signature.
@@ -207,8 +172,6 @@ def _decode_jwt_payload(jwt_token: str) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("JWT payload is not a JSON object.")
     return payload
-
-
 def _extract_ip_from_login_token(temporary_api_token: str) -> str:
     """
     Extract current public IP address from the developer portal temporary API token.
@@ -230,8 +193,6 @@ def _extract_ip_from_login_token(temporary_api_token: str) -> str:
                         return ip
 
     raise ValueError("Could not extract current IP from temporaryAPIToken payload.")
-
-
 def _devportal_get_or_create_token() -> str:
     """
     Login to the CoC developer portal and ensure a key exists for the current IP.
@@ -266,7 +227,7 @@ def _devportal_get_or_create_token() -> str:
     if not isinstance(keys, list):
         keys = []
 
-    # Prefer an existing key already matching our current IP.
+                                                             
     for key in keys:
         if not isinstance(key, dict):
             continue
@@ -282,7 +243,7 @@ def _devportal_get_or_create_token() -> str:
         ):
             return key["key"]
 
-    # No matching key found: create a new one for this IP.
+                                                          
     created = session.post(
         url=f"{DEVPORTAL_BASE}/api/apikey/create",
         json={
@@ -296,7 +257,7 @@ def _devportal_get_or_create_token() -> str:
     if not created.ok:
         raise RuntimeError(f"Failed to create developer portal key (HTTP {created.status_code}).")
 
-    # Re-list and pick the newly created key for this IP.
+                                                         
     keys_resp = session.post(
         url=f"{DEVPORTAL_BASE}/api/apikey/list",
         json={},
@@ -338,7 +299,7 @@ def get_clash_token() -> str:
         str: A valid API bearer token.
 
     Raises:
-        SystemExit: If all retry attempts are exhausted.
+        RuntimeError: If all retry attempts are exhausted.
     """
     global _clash_token, _clash_token_source
 
@@ -346,7 +307,7 @@ def get_clash_token() -> str:
         logger.critical(
             "`clashapi` is required but could not be imported. Install it or fix your environment."
         )
-        sys.exit(1)
+        raise RuntimeError("clashapi is not installed")
 
     for attempt in range(1, TOKEN_RETRY_ATTEMPTS + 1):
         try:
@@ -357,12 +318,12 @@ def get_clash_token() -> str:
                 TOKEN_RETRY_ATTEMPTS,
             )
 
-            # 1) Try clashapi first (updates keys if IP changes)
+                                                                
             tokens = clashapi.coc(CLASH_EMAIL, CLASH_PASSWORD)
             if isinstance(tokens, (list, tuple)) and tokens and isinstance(tokens[0], str) and tokens[0]:
                 token = tokens[0]
             else:
-                # 2) If there are no keys yet, create one once via portal and retry clashapi
+                                                                                            
                 logger.warning(
                     "clashapi returned no keys. Creating a developer portal key for this IP once..."
                 )
@@ -397,10 +358,10 @@ def get_clash_token() -> str:
                     "Fix: check developer portal credentials and make sure the account can create API keys.",
                     TOKEN_RETRY_ATTEMPTS,
                 )
-                sys.exit(1)
+                raise RuntimeError("Clash of Clans API token could not be retrieved")
 
-    # This line is unreachable but satisfies type checkers
-    sys.exit(1)
+                                                          
+    raise RuntimeError("Clash of Clans API token could not be retrieved")
 
 
 def refresh_token() -> str:
@@ -413,13 +374,6 @@ def refresh_token() -> str:
     """
     logger.warning("Token expired or unauthorized. Refreshing token...")
     return get_clash_token()
-
-
-# ============================================================
-# SECTION: API METHODS
-# ============================================================
-
-
 def encode_tag(tag: str) -> str:
     """
     Encode a Clash of Clans tag for use in URL paths.
@@ -433,7 +387,7 @@ def encode_tag(tag: str) -> str:
     """
     tag = tag.strip()
 
-    # Accept already-url-encoded tags too: "%23ABC" -> "#ABC"
+                                                             
     if tag.lower().startswith("%23"):
         tag = "#" + tag[3:]
 
@@ -470,7 +424,7 @@ def clash_get(endpoint: str, retry_on_auth: bool = True) -> dict | None:
         logger.info("GET %s", url)
         response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
 
-        # Handle authentication errors with token refresh
+                                                         
         if response.status_code in (401, 403):
             if retry_on_auth:
                 logger.warning(
@@ -488,12 +442,12 @@ def clash_get(endpoint: str, retry_on_auth: bool = True) -> dict | None:
                 )
                 return None
 
-        # Handle rate limiting
+                              
         if response.status_code == 429:
-            logger.warning("Rate limited by Clash of Clans API. Endpoint: %s", endpoint)
+            logger.warning("[COC_API] rate_limited endpoint=%s", endpoint)
             return {"_error": "rate_limit"}
 
-        # Maintenance / service unavailable
+                                           
         if response.status_code == 503:
             try:
                 payload = response.json()
@@ -506,12 +460,12 @@ def clash_get(endpoint: str, retry_on_auth: bool = True) -> dict | None:
             logger.warning("Clash API service unavailable (503). Endpoint: %s", endpoint)
             return {"_error": "service_unavailable"}
 
-        # Handle not found
+                          
         if response.status_code == 404:
             logger.info("Resource not found: %s", endpoint)
             return {"_error": "not_found"}
 
-        # Handle other errors
+                             
         if response.status_code != 200:
             logger.error(
                 "API returned status %d for endpoint: %s | Body: %s",
@@ -562,13 +516,6 @@ def get_player_info(player_tag: str) -> dict | None:
     """Fetch player information by player tag."""
     encoded = encode_tag(player_tag)
     return clash_get(f"/players/{encoded}")
-
-
-# ============================================================
-# SECTION: UTILITY FUNCTIONS
-# ============================================================
-
-
 def get_error_message(error_key: str) -> str:
     """
     Return a user-friendly error message for known API error keys.
@@ -696,13 +643,6 @@ def check_api_error(data: dict | None, context: str = "") -> str | None:
         return get_error_message(error_key)
 
     return None
-
-
-# ============================================================
-# SECTION: TELEGRAM HANDLERS
-# ============================================================
-
-
 def extract_tag_arg(text: str, default_tag: str | None = None) -> str | None:
     """
     Extract a single tag argument from a command text.
@@ -719,8 +659,6 @@ def extract_tag_arg(text: str, default_tag: str | None = None) -> str | None:
     if not validate_tag(tag):
         return None
     return tag
-
-
 def _registration_menu_button(chat_type: str) -> InlineKeyboardButton:
     """
     WebApp buttons are allowed only in private chats. In groups we must use a URL button.
@@ -778,8 +716,6 @@ def main_menu_keyboard(page: int = 1, chat_type: str = "supergroup") -> InlineKe
             [InlineKeyboardButton(text="➕ Ещё", callback_data="menu:more")],
         ]
     )
-
-
 def menu_keyboard_for(user_id: int | None, page: int = 1, chat_type: str = "supergroup") -> InlineKeyboardMarkup:
     """
     Show admin-only buttons only for OWNER_USER_ID.
@@ -791,7 +727,7 @@ def menu_keyboard_for(user_id: int | None, page: int = 1, chat_type: str = "supe
         uid = 0
     if uid == int(OWNER_USER_ID):
         return kb
-    # remove notify button for non-owner
+                                        
     filtered: list[list[InlineKeyboardButton]] = []
     for row in kb.inline_keyboard:
         new_row = [
@@ -802,14 +738,10 @@ def menu_keyboard_for(user_id: int | None, page: int = 1, chat_type: str = "supe
         if new_row:
             filtered.append(new_row)
     return InlineKeyboardMarkup(inline_keyboard=filtered)
-
-
 def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")]]
     )
-
-
 def _thread_id_from_message(message: Message | None) -> int | None:
     """
     Return Telegram forum topic thread id for this message, if any.
@@ -822,8 +754,6 @@ def _thread_id_from_message(message: Message | None) -> int | None:
         return int(tid) if tid is not None else None
     except Exception:
         return None
-
-
 async def _answer_in_thread(message: Message, text: str, **kwargs):
     """
     Answer in the same topic thread (if chat has Topics enabled).
@@ -832,8 +762,6 @@ async def _answer_in_thread(message: Message, text: str, **kwargs):
     if tid is not None and "message_thread_id" not in kwargs:
         kwargs["message_thread_id"] = tid
     return await message.answer(text, **kwargs)
-
-
 async def _clear_legacy_reply_keyboard(message: Message) -> None:
     """
     If an old ReplyKeyboard is still shown (from older bot versions), hide it.
@@ -918,7 +846,7 @@ def members_pager_keyboard(page: int, total_pages: int, chunk: list[dict]) -> In
     if nav_row:
         keyboard.append(nav_row)
 
-    # Member quick buttons (open profile)
+                                         
     if chunk:
         row: list[InlineKeyboardButton] = []
         for idx, m in enumerate(chunk, start=1):
@@ -973,7 +901,24 @@ async def _edit_or_send(message: Message, text: str, reply_markup: InlineKeyboar
 
 
 async def _api(func, *args, **kwargs):
-    return await asyncio.to_thread(func, *args, **kwargs)
+    started = time.perf_counter()
+    result = await asyncio.to_thread(func, *args, **kwargs)
+    logger.debug("[COC_API] call=%s duration=%.3fs", getattr(func, "__name__", "unknown"), time.perf_counter() - started)
+    return result
+
+
+def _consume_heavy_request(telegram_user_id: int) -> int:
+    now = time.monotonic()
+    user_id = int(telegram_user_id or 0)
+    bucket = _heavy_request_times[user_id]
+    while bucket and now - bucket[0] >= HEAVY_REQUEST_WINDOW_SECONDS:
+        bucket.popleft()
+    if len(bucket) >= HEAVY_REQUEST_LIMIT:
+        retry_after = max(1, int(HEAVY_REQUEST_WINDOW_SECONDS - (now - bucket[0])) + 1)
+        logger.warning("[RATE_LIMIT] user_id=%s blocked retry_after=%ss", user_id, retry_after)
+        return retry_after
+    bucket.append(now)
+    return 0
 
 
 def _safe(s: object) -> str:
@@ -991,7 +936,7 @@ def _extract_clan_war_league_name(clan_info: dict | None) -> str | None:
 
 
 def _mention_html(user_id: int, visible_name: str) -> str:
-    # Telegram supports tg://user?id=... links in HTML parse mode
+                                                                 
     return f'<a href="tg://user?id={int(user_id)}">{_safe(visible_name)}</a>'
 
 
@@ -1041,7 +986,7 @@ async def _acquire_polling_lock() -> None:
         return
     try:
         conn = await pool.acquire()
-        # Any constant 64-bit key. Using a stable number makes the lock global.
+                                                                               
         await conn.execute("SELECT pg_advisory_lock(734271234987654321)")
         _poll_lock_conn = conn
         logger.info("Polling lock acquired (Postgres advisory lock).")
@@ -1102,12 +1047,180 @@ async def _pg_ensure_schema() -> None:
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               PRIMARY KEY (chat_id, telegram_user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS war_notifications (
+              war_id TEXT NOT NULL,
+              notification_type TEXT NOT NULL,
+              sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (war_id, notification_type)
+            );
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS chat_id BIGINT;
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS message_text TEXT NOT NULL DEFAULT '';
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'sent';
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMPTZ;
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+            ALTER TABLE war_notifications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+            ALTER TABLE war_notifications ALTER COLUMN sent_at DROP NOT NULL;
+            ALTER TABLE war_notifications ALTER COLUMN sent_at DROP DEFAULT;
+            CREATE INDEX IF NOT EXISTS war_notifications_delivery_idx
+              ON war_notifications (chat_id, status, next_retry_at);
+            CREATE INDEX IF NOT EXISTS war_notifications_processing_idx
+              ON war_notifications (chat_id, status, processing_started_at);
             """
         )
 
 
 class LinkAlreadyBoundError(RuntimeError):
     pass
+
+
+async def _db_queue_war_notification(war_id: str, notification_type: str, chat_id: int, message_text: str) -> str | None:
+    if not war_id or not notification_type or not message_text:
+        return None
+    try:
+        await _pg_ensure_schema()
+        pool = await _pg_get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO war_notifications (
+                  war_id, notification_type, chat_id, message_text, status,
+                  attempt_count, last_error, next_retry_at, created_at, updated_at, sent_at
+                )
+                VALUES ($1, $2, $3, $4, 'pending', 0, '', NOW(), NOW(), NOW(), NULL)
+                ON CONFLICT (war_id, notification_type) DO NOTHING
+                RETURNING status
+                """,
+                war_id,
+                notification_type,
+                int(chat_id),
+                message_text,
+            )
+            if row is not None:
+                logger.info("[WAR] notification_queued war_id=%s type=%s", war_id, notification_type)
+                return "pending"
+            existing = await conn.fetchrow(
+                "SELECT status FROM war_notifications WHERE war_id=$1 AND notification_type=$2",
+                war_id,
+                notification_type,
+            )
+        return str(existing["status"] or "sent") if existing else None
+    except Exception as exc:
+        logger.warning("[DB] notification_queue_failed war_id=%s type=%s error=%s", war_id, notification_type, exc)
+        return None
+
+
+async def _db_claim_due_war_notifications(chat_id: int, limit: int = 10) -> list[dict]:
+    try:
+        await _pg_ensure_schema()
+        pool = await _pg_get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                expired = await conn.execute(
+                    """
+                    UPDATE war_notifications
+                    SET status=CASE WHEN attempt_count >= $2 THEN 'dead' ELSE 'failed' END,
+                        last_error=CASE WHEN last_error='' THEN 'delivery lease expired' ELSE last_error END,
+                        next_retry_at=CASE WHEN attempt_count >= $2 THEN NULL ELSE NOW() END,
+                        processing_started_at=NULL,
+                        updated_at=NOW()
+                    WHERE chat_id=$1
+                      AND status='processing'
+                      AND processing_started_at <= NOW() - ($3 * INTERVAL '1 second')
+                    """,
+                    int(chat_id),
+                    int(WAR_NOTIFICATION_MAX_ATTEMPTS),
+                    int(WAR_NOTIFICATION_LEASE_SECONDS),
+                )
+                if expired != "UPDATE 0":
+                    logger.warning("[WAR] notification_lease_recovered chat_id=%s rows=%s", chat_id, expired.split()[-1])
+                rows = await conn.fetch(
+                    """
+                    WITH due AS (
+                      SELECT war_id, notification_type
+                      FROM war_notifications
+                      WHERE chat_id=$1
+                        AND status IN ('pending', 'failed')
+                        AND attempt_count < $2
+                        AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                      ORDER BY COALESCE(next_retry_at, created_at), created_at
+                      LIMIT $3
+                      FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE war_notifications AS notification
+                    SET status='processing',
+                        attempt_count=notification.attempt_count + 1,
+                        processing_started_at=NOW(),
+                        next_retry_at=NULL,
+                        updated_at=NOW()
+                    FROM due
+                    WHERE notification.war_id=due.war_id
+                      AND notification.notification_type=due.notification_type
+                    RETURNING notification.war_id, notification.notification_type, notification.chat_id,
+                              notification.message_text, notification.status, notification.attempt_count
+                    """,
+                    int(chat_id),
+                    int(WAR_NOTIFICATION_MAX_ATTEMPTS),
+                    int(limit),
+                )
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning("[DB] notification_claim_failed chat_id=%s error=%s", chat_id, exc)
+        return []
+
+
+async def _db_mark_war_notification_sent(war_id: str, notification_type: str) -> bool:
+    pool = await _pg_get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE war_notifications
+            SET status='sent', sent_at=NOW(), last_error='', next_retry_at=NULL,
+                processing_started_at=NULL, updated_at=NOW()
+            WHERE war_id=$1 AND notification_type=$2 AND status='processing'
+            """,
+            war_id,
+            notification_type,
+        )
+    return result == "UPDATE 1"
+
+
+async def _db_mark_war_notification_failed(war_id: str, notification_type: str, error: object) -> tuple[str, int] | None:
+    pool = await _pg_get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE war_notifications
+            SET status=CASE WHEN attempt_count >= $4 THEN 'dead' ELSE 'failed' END,
+                last_error=$3,
+                next_retry_at=CASE
+                  WHEN attempt_count >= $4 THEN NULL
+                  ELSE NOW() + (
+                    CASE LEAST(attempt_count, 6)
+                      WHEN 1 THEN 60
+                      WHEN 2 THEN 300
+                      WHEN 3 THEN 900
+                      WHEN 4 THEN 1800
+                      ELSE 3600
+                    END * INTERVAL '1 second'
+                  )
+                END,
+                processing_started_at=NULL,
+                updated_at=NOW()
+            WHERE war_id=$1 AND notification_type=$2 AND status='processing'
+            RETURNING status, attempt_count
+            """,
+            war_id,
+            notification_type,
+            str(error)[:500],
+            int(WAR_NOTIFICATION_MAX_ATTEMPTS),
+        )
+    if row is None:
+        return None
+    return str(row["status"] or "failed"), int(row["attempt_count"] or 0)
 
 
 async def _db_upsert_link(
@@ -1156,7 +1269,9 @@ async def _db_upsert_link(
             if "coc_links_coc_tag_uidx" in msg or ("duplicate key" in msg and "coc_tag" in msg):
                 raise LinkAlreadyBoundError("Этот Clash-аккаунт уже привязан к другому Telegram-профилю.") from exc
             raise
-        return not current or _norm_tag(current["coc_tag"]) != coc_tag_n
+        changed = not current or _norm_tag(current["coc_tag"]) != coc_tag_n
+        logger.info("[DB] link_saved user_id=%s coc_tag=%s changed=%s", uid, coc_tag_n, changed)
+        return changed
 
 
 async def _refresh_links_cache(force: bool = False) -> None:
@@ -1343,6 +1458,51 @@ async def _db_get_group_nicks(chat_id: int) -> list[dict]:
     return result
 
 
+async def _db_delete_group_nick(chat_id: int, telegram_user_id: int) -> bool:
+    await _pg_ensure_schema()
+    pool = await _pg_get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM group_nicks WHERE chat_id=$1 AND telegram_user_id=$2",
+            int(chat_id),
+            int(telegram_user_id),
+        )
+    return result.endswith("1")
+
+
+def _normalize_game_nick_for_match(value: object) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+async def _group_nick_mention_map(chat_id: int) -> dict[str, int]:
+    try:
+        rows = await _db_get_group_nicks(int(chat_id))
+    except Exception as exc:
+        logger.warning("[NICKS] mention_map_failed chat_id=%s error=%s", chat_id, exc)
+        return {}
+    candidates: dict[str, list[int]] = {}
+    for row in rows:
+        nick = _normalize_game_nick_for_match(row.get("game_nick"))
+        user_id = int(row.get("telegram_user_id") or 0)
+        if nick and user_id:
+            candidates.setdefault(nick, []).append(user_id)
+    result: dict[str, int] = {}
+    for nick, user_ids in candidates.items():
+        unique_ids = sorted(set(user_ids))
+        if len(unique_ids) == 1:
+            result[nick] = unique_ids[0]
+        else:
+            logger.warning("[NICKS] ambiguous_nick chat_id=%s nick=%s user_ids=%s", chat_id, nick, unique_ids)
+    return result
+
+
+def _mention_from_group_nicks(name: str, mention_map: dict[str, int]) -> str:
+    user_id = mention_map.get(_normalize_game_nick_for_match(name))
+    if user_id:
+        return _mention_html(user_id, name)
+    return f"<b>{_safe(name)}</b>"
+
+
 def registration_prompt_text(user) -> str:
     who = _tg_user_display(user) if user is not None else "<b>Привет</b>"
     return (
@@ -1375,7 +1535,7 @@ def registration_keyboard_for(chat_type: str, bot_username: str | None = None) -
             ]
         )
 
-    # Group mode: open private chat via deep link
+                                                 
     uname = (bot_username or _BOT_USERNAME or "").strip().lstrip("@")
     if uname:
         url = f"https://t.me/{uname}?start=reg"
@@ -1384,7 +1544,7 @@ def registration_keyboard_for(chat_type: str, bot_username: str | None = None) -
                 [InlineKeyboardButton(text="✅ Зарегистрироваться", url=url)],
             ]
         )
-    # Fallback: show instructions (still no web_app button)
+                                                           
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data="menu:webapp")],
@@ -1421,9 +1581,9 @@ def _validate_webapp_init_data(init_data: str) -> dict | None:
         v = (data.get(k) or [""])[0]
         pairs.append(f"{k}={v}")
     data_check_string = "\n".join(pairs)
-    # Telegram WebApp initData signature:
-    # secret_key = HMAC_SHA256("WebAppData", bot_token)
-    # hash = HMAC_SHA256(data_check_string, secret_key)
+                                         
+                                                       
+                                                       
     secret_key = hmac.new(
         b"WebAppData",
         TELEGRAM_BOT_TOKEN.encode("utf-8"),
@@ -1656,7 +1816,7 @@ def build_members_text(members: list[dict], page: int, per_page: int) -> tuple[s
         ranked_league = _safe((member.get("leagueTier") or {}).get("name", "—"))
         builder_league = _safe((member.get("builderBaseLeague") or {}).get("name", ""))
 
-        # New ranked system (leagueTier) is shown first
+                                                       
         league_parts = [f"⚡ {ranked_league}", f"🏅 {trophy_league}"]
         if builder_league:
             league_parts.append(f"🔨 {builder_league}")
@@ -1773,7 +1933,7 @@ def _completion_ratio(items: list[dict], village: str | None = None) -> tuple[fl
             mx = float(it.get("maxLevel", it.get("max_level", 0)) or 0)
         except Exception:
             mx = 0.0
-        # If API doesn't provide maxLevel for some items, treat current level as max for scoring.
+                                                                                                 
         if mx <= 0:
             mx = max(1.0, lvl)
         num += max(0.0, min(lvl, mx))
@@ -1783,10 +1943,10 @@ def _completion_ratio(items: list[dict], village: str | None = None) -> tuple[fl
 
 def _load_font(size: int) -> ImageFont.ImageFont:
     candidates = [
-        # Linux (Render)
+                        
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        # Windows
+                 
         "C:\\Windows\\Fonts\\arial.ttf",
         "C:\\Windows\\Fonts\\calibri.ttf",
     ]
@@ -1830,8 +1990,8 @@ def render_player_report_image(
     Creates a clear, readable PNG with category bars (0..100%).
     """
     width, height = 1200, 720
-    # Calm, non-neon palette
-    bg = (12, 14, 18)  # graphite
+                            
+    bg = (12, 14, 18)            
     card = (20, 23, 30)
     card2 = (26, 30, 40)
     text_main = (230, 237, 243)
@@ -1840,8 +2000,8 @@ def render_player_report_image(
     track = (34, 44, 60)
 
     img = Image.new("RGB", (width, height), bg)
-    # Drawing 720 horizontal lines is much faster than assigning all 864,000
-    # pixels in Python one at a time, while producing the same gradient.
+                                                                            
+                                                                        
     gradient = ImageDraw.Draw(img)
     for y in range(height):
         t = y / max(1, height - 1)
@@ -1859,8 +2019,8 @@ def render_player_report_image(
 
     pad = 48
 
-    # Header card
-    # Soft glow behind header
+                 
+                             
     draw.rounded_rectangle((pad - 6, 22, width - pad + 6, 178), radius=28, fill=(16, 18, 24))
     draw.rounded_rectangle((pad, 28, width - pad, 172), radius=24, fill=card)
     draw.text((pad + 30, 48), title, font=font_title, fill=text_main)
@@ -1869,7 +2029,7 @@ def render_player_report_image(
     upd_x = (width - pad - 30) - _text_w(draw, upd, font_small)
     draw.text((upd_x, 122), upd, font=font_small, fill=muted)
 
-    # Main card
+               
     draw.rounded_rectangle((pad - 6, 190, width - pad + 6, height - 70), radius=28, fill=(16, 18, 24))
     draw.rounded_rectangle((pad, 196, width - pad, height - 76), radius=24, fill=card)
 
@@ -1885,21 +2045,21 @@ def render_player_report_image(
     for k in order:
         if k in scores:
             items.append((k, int(scores.get(k, 0) or 0)))
-    # fallback for any extra keys
+                                 
     for k, v in scores.items():
         if k not in order:
             items.append((k, int(v or 0)))
 
-    # Left: radar chart
+                       
     radar_cx = pad + 260
     radar_cy = 420
     radar_r = 170
 
-    # grid
+          
     for g in (20, 40, 60, 80, 100):
         pts = _radar_points(radar_cx, radar_cy, radar_r, [g] * len(items))
         draw.polygon(pts, outline=(38, 50, 68))
-    # axes + labels
+                   
     import math
 
     label_font = _load_font(18)
@@ -1909,20 +2069,20 @@ def render_player_report_image(
         y2 = int(round(radar_cy + math.sin(ang) * (radar_r + 18)))
         draw.line((radar_cx, radar_cy, x2, y2), fill=(38, 50, 68), width=2)
 
-        # label position
+                        
         lx = int(round(radar_cx + math.cos(ang) * (radar_r + 42)))
         ly = int(round(radar_cy + math.sin(ang) * (radar_r + 42)))
-        # keep label readable: short name
+                                         
         short = name.replace("Главная деревня", "Деревня").replace("Стройбаза", "База").replace("Активность", "Актив.")
         w = _text_w(draw, short, label_font)
         draw.text((lx - w // 2, ly - 10), short, font=label_font, fill=text_sub)
 
     vals = [v for _k, v in items]
     poly = _radar_points(radar_cx, radar_cy, radar_r, vals)
-    # semi-transparent fill via overlay
+                                       
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     d2 = ImageDraw.Draw(overlay)
-    # muted steel-blue
+                      
     d2.polygon(poly, fill=(90, 130, 180, 70), outline=(90, 130, 180, 210))
     for x, y in poly:
         d2.ellipse((x - 5, y - 5, x + 5, y + 5), fill=(90, 130, 180, 230))
@@ -1931,7 +2091,7 @@ def render_player_report_image(
     img = img_rgba.convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # Right: metric list with bars
+                                  
     list_left = pad + 520
     top = 230
     bar_w = (width - pad) - list_left - 30
@@ -1955,13 +2115,13 @@ def render_player_report_image(
         filled = int(prog_w * val_i / 100)
 
         if val_i >= 80:
-            color = (70, 170, 120)   # calm green
+            color = (70, 170, 120)               
         elif val_i >= 60:
-            color = (90, 130, 180)   # steel blue
+            color = (90, 130, 180)               
         elif val_i >= 40:
-            color = (200, 170, 80)   # muted amber
+            color = (200, 170, 80)                
         else:
-            color = (200, 90, 90)    # muted red
+            color = (200, 90, 90)               
 
         if filled > 0:
             draw.rounded_rectangle((prog_x0, prog_y0, prog_x0 + filled, prog_y0 + prog_h), radius=10, fill=color)
@@ -2001,7 +2161,7 @@ def build_player_report_caption(
     war_stars = format_number(player.get("warStars"))
     attack_wins = format_number(player.get("attackWins"))
 
-    # Weighted overall (more fair)
+                                  
     weights = {
         "Главная деревня": 0.35,
         "Войны": 0.20,
@@ -2071,7 +2231,7 @@ def _capital_member_from_seasons(seasons: dict | None, player_tag: str, max_item
         if not isinstance(season, dict):
             continue
 
-        # 1) Prefer explicit member summary when available (usually for latest season)
+                                                                                      
         members = season.get("members")
         if isinstance(members, list):
             for m in members:
@@ -2084,7 +2244,7 @@ def _capital_member_from_seasons(seasons: dict | None, player_tag: str, max_item
                 counted += 1
                 break
 
-        # 2) Fallback: parse attackLog to count attacks for this attacker (works for older seasons too)
+                                                                                                       
         attack_log = season.get("attackLog")
         if isinstance(attack_log, list):
             for base in attack_log:
@@ -2099,7 +2259,7 @@ def _capital_member_from_seasons(seasons: dict | None, player_tag: str, max_item
                     attacks = d.get("attacks") or []
                     if not isinstance(attacks, list):
                         continue
-                    # district loot is total; we attribute proportionally to attacks (best-effort)
+                                                                                                  
                     district_loot = int(d.get("totalLooted", 0) or 0)
                     district_total_attacks = max(1, int(d.get("attackCount", len(attacks)) or len(attacks) or 1))
                     for a in attacks:
@@ -2114,7 +2274,7 @@ def _capital_member_from_seasons(seasons: dict | None, player_tag: str, max_item
                         total_attack_rows += 1
                         total_stars += int(a.get("stars", 0) or 0)
                         total_destr += int(a.get("destructionPercent", a.get("destructionPercentage", 0)) or 0)
-                        # proportional loot
+                                           
                         total_looted += int(round(district_loot / district_total_attacks))
 
     avg_stars = (total_stars / total_attack_rows) if total_attack_rows else 0.0
@@ -2233,7 +2393,7 @@ def _compute_player_scores(
     """
     context_label = "Свежие данные по кнопке «Обновить»"
 
-    # Development completion
+                            
     troops = player.get("troops") or []
     spells = player.get("spells") or []
     heroes = player.get("heroes") or []
@@ -2259,14 +2419,14 @@ def _compute_player_scores(
     dev_num = he_n * 3 + tr_n * 2 + sp_n * 1.5 + pe_n * 1.5 + eq_n * 2
     dev_den = he_d * 3 + tr_d * 2 + sp_d * 1.5 + pe_d * 1.5 + eq_d * 2
     base_dev = _score_percent(dev_num, dev_den) if dev_den > 0 else 0
-    # Slight uplift to avoid "too low" feel for mid accounts, but still capped.
+                                                                               
     development = int(min(100, round(base_dev * 0.90 + 10)))
 
-    # Builder base score
+                        
     bh = int(player.get("builderHallLevel", 0) or 0)
     bb_trophies = int(player.get("builderBaseTrophies", player.get("versusTrophies", 0)) or 0)
     bb_wins = int(player.get("versusBattleWins", 0) or 0)
-    # scale: BH 1..11+, trophies 0..6000, wins 0..5000
+                                                      
     bb_score = int(
         max(
             0,
@@ -2277,12 +2437,12 @@ def _compute_player_scores(
         )
     )
 
-    # Capital raids score (last ~3 seasons)
+                                           
     cap = _capital_member_from_seasons(raid_seasons, str(player.get("tag", "")), max_items=10)
     cap_attacks = int(cap.get("attacks", 0) or 0)
     cap_loot = int(cap.get("loot", 0) or 0)
     cap_avg_destr = float(cap.get("avg_destr", 0.0) or 0.0)
-    # Attacks: ~0..18 (3 weekends), plus quality signal from average destruction.
+                                                                                 
     cap_score = int(
         max(
             0,
@@ -2297,23 +2457,23 @@ def _compute_player_scores(
         )
     )
 
-    # Donations (seasonal)
+                          
     don = int(player.get("donations", 0) or 0)
     rec = int(player.get("donationsReceived", 0) or 0)
     donation_score = int(min(100, round((don / 1200) * 100))) if don > 0 else 0
-    # bonus for positive ratio
+                              
     ratio_bonus = 0
     if don + rec > 0:
         ratio_bonus = int(round((don / (don + rec)) * 25))
     donation_score = max(0, min(100, donation_score + ratio_bonus))
 
-    # War score (lifetime, since API doesn't provide full per-war details for normal wars)
+                                                                                          
     war_stars = int(player.get("warStars", 0) or 0)
     base_war = int(max(0, min(100, round(min(1.0, war_stars / 3000) * 100))))
     cwl_score = int((cwl_stats or {}).get("score", 0) or 0) if isinstance(cwl_stats, dict) else 0
     war_score = int(round(base_war * 0.65 + cwl_score * 0.35)) if cwl_score else base_war
 
-    # Activity (best-effort)
+                            
     attack_wins = int(player.get("attackWins", 0) or 0)
     defense_wins = int(player.get("defenseWins", 0) or 0)
     activity = int(
@@ -2372,6 +2532,7 @@ async def _build_and_send_player_report(
         except Exception:
             pass
 
+    report_started = time.perf_counter()
     total_steps = 6
     await _progress(0, total_steps, "Собираю данные игрока…")
 
@@ -2384,9 +2545,9 @@ async def _build_and_send_player_report(
             await _edit_or_send(target_message, err, main_menu_keyboard())
         return None
 
-    # These three API calls do not depend on one another.  Starting them
-    # together removes the intentionally added 7.8-second wait from report
-    # creation and makes the perceived progress reflect real work.
+                                                                        
+                                                                          
+                                                                  
     await _progress(1, total_steps, "Собираю данные клана, столицы и ЛВК…")
     members_task = asyncio.create_task(_api(get_clan_members, CLAN_TAG))
     raids_task = asyncio.create_task(_api(get_capital_raid_seasons, 10))
@@ -2397,7 +2558,7 @@ async def _build_and_send_player_report(
     cwl_wars = results[2] if isinstance(results[2], list) else []
 
     await _progress(2, total_steps, "Сверяю участника клана…")
-    # Clan members to get role/name consistency
+                                               
     members_err = check_api_error(members_data, context="player stats clan members")
     members = (members_data or {}).get("items", []) if isinstance(members_data, dict) else []
     member = None
@@ -2417,7 +2578,7 @@ async def _build_and_send_player_report(
     await _progress(4, total_steps, "Считаю оценки…")
     scores, context_label = _compute_player_scores(player or {}, member, raids, cwl_stats)
 
-    # Header
+            
     pname = _safe((player or {}).get("name", "Игрок"))
     th = (player or {}).get("townHallLevel", "—")
     league = _safe(((player or {}).get("league") or {}).get("name", "—"))
@@ -2489,6 +2650,7 @@ async def _build_and_send_player_report(
             media=media,
             reply_markup=kb,
         )
+        logger.info("[PHOTO] player_report tag=%s mode=edit duration=%.3fs", tag, time.perf_counter() - report_started)
         return edit_message_id
 
     sent = await bot.send_photo(
@@ -2498,6 +2660,7 @@ async def _build_and_send_player_report(
         parse_mode="HTML",
         reply_markup=kb,
     )
+    logger.info("[PHOTO] player_report tag=%s mode=send duration=%.3fs", tag, time.perf_counter() - report_started)
     return sent.message_id
 
 
@@ -2507,7 +2670,7 @@ def build_war_text(data: dict, *, mode: str = "war", include_title: bool = True)
     default_apm = 1 if mode == "cwl" else 2
     attacks_per_member = int(data.get("attacksPerMember", default_apm) or default_apm)
     if mode == "cwl":
-        # В ЛВК всегда 1 атака на участника за день войны
+                                                         
         attacks_per_member = 1
 
     our = data.get("clan", {}) or {}
@@ -2568,12 +2731,12 @@ def build_war_text(data: dict, *, mode: str = "war", include_title: bool = True)
                 attacks_flat.append(a)
     attacks_flat.sort(key=lambda a: a.get("order", 10**9))
 
-    # Render attack list:
-    # - for small wars (<=20) show all attacks
-    # - for large wars show the latest 25 (keeps message within Telegram limits)
+                         
+                                              
+                                                                                
     attack_limit = 25
     if str(team_size).isdigit() and int(team_size) <= 20:
-        attack_limit = 200  # effectively "all"
+        attack_limit = 200                     
     attacks_slice = attacks_flat[-attack_limit:]
 
     last_attacks_lines: list[str] = []
@@ -2949,7 +3112,7 @@ def get_war_missing_attacks(war: dict, clan_tag: str) -> tuple[str, list[str], s
       end_time: endTime string (API format)
     """
     state = str(war.get("state", "notInWar"))
-    # For preparation we count down to the battle start, for inWar — to the battle end.
+                                                                                       
     deadline = war.get("endTime") if state == "inWar" else war.get("startTime")
     end_time = str(deadline or "")
 
@@ -3016,7 +3179,7 @@ def _format_missing_block(missing: list[str], limit: int = 20) -> str:
     return "Кому ещё нужно атаковать:\n" + block
 
 
-def build_war_end_text(war: dict, *, kind: str) -> str:
+def build_war_end_text(war: dict, *, kind: str, mention_player=None) -> str:
     """Create a readable final result for both regular wars and CWL wars."""
     our, opp = _war_sides(war, CLAN_TAG)
     result = _war_result_label(our, opp)
@@ -3035,11 +3198,11 @@ def build_war_end_text(war: dict, *, kind: str) -> str:
     opp_by_tag = {_norm_tag(m.get("tag")): m for m in opp_members}
     used_attacks = sum(len(m.get("attacks", []) or []) for m in our_members)
     no_attack: list[str] = []
-    attack_lines: list[str] = []
+    attack_blocks: list[str] = []
 
     for member in our_members:
         raw_name = str(member.get("name") or "—")
-        name = _maybe_mention_player(raw_name, member.get("tag"))
+        name = mention_player(raw_name) if mention_player else _maybe_mention_player(raw_name, member.get("tag"))
         attacks = [a for a in (member.get("attacks") or []) if isinstance(a, dict)]
         if not attacks:
             no_attack.append(name)
@@ -3056,12 +3219,13 @@ def build_war_end_text(war: dict, *, kind: str) -> str:
             defender = opp_by_tag.get(_norm_tag(attack.get("defenderTag"))) or {}
             target_name = _safe(defender.get("name") or attack.get("defenderTag") or "цель")
             target_pos = defender.get("mapPosition", "?")
-            hits.append(f"#{target_pos} {target_name}: ⭐{stars} • 💥{destruction:.0f}%")
+            hits.append(f"↳ #{target_pos} <b>{target_name}</b> — ⭐{stars} • 💥{destruction:.0f}%")
 
-        attack_lines.append(
-            f"• {name} — <b>{len(attacks)}/{attacks_per_member}</b> атак "
-            f"• ⭐<b>{stars_total}</b> • 💥<b>{destruction_total:.0f}%</b>\n"
-            f"  {'; '.join(hits)}"
+        attack_blocks.append(
+            f"👤 {name}\n"
+            f"Атаки: <b>{len(attacks)}/{attacks_per_member}</b> • "
+            f"⭐<b>{stars_total}</b> • 💥<b>{destruction_total:.0f}%</b>\n"
+            + "\n".join(hits)
         )
 
     result_icon = {"Победа": "🏆", "Поражение": "💢", "Ничья": "🤝"}.get(result, "🏁")
@@ -3075,15 +3239,15 @@ def build_war_end_text(war: dict, *, kind: str) -> str:
         "💥 <b>Разрушение</b>\n"
         f"<b>{our_name}</b> — <b>{our_destr:.2f}%</b>\n"
         f"<b>{opp_name}</b> — <b>{opp_destr:.2f}%</b>\n\n"
-        f"🎯 <b>Использовано атак:</b> <b>{used_attacks}/{total_attacks or '—'}</b>"
+        f"🎯 <b>Использовано атак:</b> <b>{used_attacks} из {total_attacks or '—'}</b>"
     )
 
     if no_attack:
         no_attack_lines: list[str] = []
         for name in no_attack:
             candidate = f"• {name}"
-            # Reserve enough room for actual attack results below.  This also
-            # keeps an unusually long roster within Telegram's 4096 limit.
+                                                                             
+                                                                          
             if sum(len(line) + 1 for line in no_attack_lines) + len(candidate) > 1500:
                 break
             no_attack_lines.append(candidate)
@@ -3093,22 +3257,58 @@ def build_war_end_text(war: dict, *, kind: str) -> str:
     else:
         text += "\n\n✅ <b>Все участники атаковали.</b>"
 
-    if not attack_lines:
+    if not attack_blocks:
         return text
 
     text += "\n\n⚔️ <b>Результаты атак:</b>"
-    # Telegram limits messages to 4096 characters.  Keep the critical result
-    # and the complete "без атак" list, then add as many detailed attacks as fit.
+                                                                            
+                                                                                 
     shown = 0
-    for line in attack_lines:
-        candidate = f"\n{line}"
+    for block in attack_blocks:
+        candidate = f"\n\n{block}"
         if len(text) + len(candidate) > 3850:
             break
         text += candidate
         shown += 1
-    if shown < len(attack_lines):
-        text += f"\n… подробности показаны для {shown} из {len(attack_lines)} атаковавших."
+    if shown < len(attack_blocks):
+        text += f"\n\n… подробности показаны для {shown} из {len(attack_blocks)} атаковавших."
     return text
+
+
+async def _deliver_due_war_notifications(bot: Bot, chat_id: int, topic_tid: int | None) -> None:
+    for row in await _db_claim_due_war_notifications(chat_id):
+        war_id = str(row.get("war_id") or "")
+        notification_type = str(row.get("notification_type") or "")
+        attempts = int(row.get("attempt_count") or 0)
+        if attempts > 1:
+            logger.info("[WAR] notification_retry war_id=%s type=%s attempt=%s", war_id, notification_type, attempts)
+        try:
+            await bot.send_message(
+                chat_id,
+                str(row.get("message_text") or ""),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                message_thread_id=topic_tid,
+            )
+        except Exception as exc:
+            try:
+                failure = await _db_mark_war_notification_failed(war_id, notification_type, exc)
+                if failure is None:
+                    logger.warning("[WAR] notification_failure_state_lost war_id=%s type=%s error=%s", war_id, notification_type, exc)
+                else:
+                    status, attempt_count = failure
+                    event = "notification_dead" if status == "dead" else "notification_failed"
+                    logger.warning("[WAR] %s war_id=%s type=%s attempt=%s error=%s", event, war_id, notification_type, attempt_count, exc)
+            except Exception as db_exc:
+                logger.error("[DB] notification_failure_save_failed war_id=%s type=%s error=%s", war_id, notification_type, db_exc)
+            continue
+        try:
+            if await _db_mark_war_notification_sent(war_id, notification_type):
+                logger.info("[WAR] notification_sent war_id=%s type=%s", war_id, notification_type)
+            else:
+                logger.warning("[WAR] notification_sent_state_lost war_id=%s type=%s", war_id, notification_type)
+        except Exception as exc:
+            logger.error("[DB] notification_sent_mark_failed war_id=%s type=%s error=%s", war_id, notification_type, exc)
 
 
 async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
@@ -3120,20 +3320,20 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
     - last hour (or final minutes)
     - end result
     """
-    # Polling interval: keep it calm to avoid spam and rate limits.
-    poll_seconds = 420  # 7 minutes
+                                                                   
+    poll_seconds = 420             
 
     active_id: str | None = None
-    active_kind: str | None = None  # "КВ" | "ЛВК"
+    active_kind: str | None = None                
     active_war_tag: str | None = None
     sent: set[str] = set()
     idle_misses = 0
-    # CWL full scan (leaguegroup + wars) is expensive. Do it редко.
-    cwl_scan_cooldown_seconds = 600  # 10 минут
+                                                                   
+    cwl_scan_cooldown_seconds = 600            
     cwl_next_scan_at: float = 0.0
 
-    # In forum supergroups, background messages must include message_thread_id
-    # to land in the correct topic. Otherwise they go to "General".
+                                                                              
+                                                                   
     topic_tid: int | None = None
     try:
         if int(chat_id) == int(CHAT_ID) and int(CHAT_MAIN_THREAD_ID or 0) > 0:
@@ -3153,6 +3353,12 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
     while True:
         try:
             await _refresh_links_cache()
+            await _deliver_due_war_notifications(bot, chat_id, topic_tid)
+            mention_map = await _group_nick_mention_map(chat_id)
+
+            def _mention_war_player(name: str) -> str:
+                return _mention_from_group_nicks(name, mention_map)
+
             now = datetime.now(timezone.utc)
 
             kind = ""
@@ -3160,9 +3366,9 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
             war_id = ""
             war_tag = None
 
-            # Try to keep CWL checks cheap:
-            # - if we already know the current CWL war tag, check it first (1 request)
-            # - otherwise, do a full scan (leaguegroup + multiple wars) only every ~10 minutes
+                                           
+                                                                                      
+                                                                                              
             cwl_tag: str | None = None
             cwl_war: dict | None = None
             if active_kind == "ЛВК" and active_war_tag:
@@ -3174,7 +3380,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                 }:
                     cwl_tag, cwl_war = active_war_tag, cw
                 else:
-                    # War tag is stale — allow scan soon
+                                                        
                     active_war_tag = None
                     active_kind = None
 
@@ -3193,11 +3399,11 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     war = kv
                     war_id = _war_id_kv(kv)
 
-            # No active war/prep:
-            # Don't immediately reset state (API can flake and cause duplicate milestone posts).
+                                 
+                                                                                                
             if not kind or not isinstance(war, dict):
                 idle_misses += 1
-                if idle_misses >= 6:  # ~40 minutes
+                if idle_misses >= 6:               
                     active_id = None
                     active_kind = None
                     active_war_tag = None
@@ -3211,7 +3417,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                 await asyncio.sleep(poll_seconds)
                 continue
 
-            # Switch to a new war instance
+                                          
             if war_id != active_id:
                 active_id = war_id
                 active_kind = kind
@@ -3222,7 +3428,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
             opp_name = _safe(opp.get("name", "соперник"))
             team_size = war.get("teamSize", "—")
 
-            # Timing
+                    
             start_dt = _parse_coc_time(str(war.get("startTime") or ""))
             end_dt = _parse_coc_time(str(war.get("endTime") or ""))
             if not start_dt or not end_dt:
@@ -3234,7 +3440,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
             if state == "inWar" and elapsed > poll_seconds * 2 and "start" not in sent:
                 sent.add("start")
 
-            # Missing list (only meaningful inWar)
+                                                  
             attacks_per_member = 1 if kind == "ЛВК" else int(war.get("attacksPerMember", 2) or 2)
             missing_lines: list[str] = []
             members = (our.get("members") or []) if isinstance(our.get("members"), list) else []
@@ -3245,10 +3451,10 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                 if used < attacks_per_member:
                     raw_name = str(m.get("name", "—") or "—")
                     th = m.get("townhallLevel", m.get("townHallLevel", "?"))
-                    name_html = _maybe_mention_player(raw_name, m.get("tag"))
+                    name_html = _mention_war_player(raw_name)
                     missing_lines.append(f"{name_html} (TH{th}) — {used}/{attacks_per_member}")
  
-            # Milestones (dedup even if the loop restarts)
+                                                          
             war_sent = _broadcast_sent.get(active_id or "", {})
             now_ts = time.time()
 
@@ -3259,7 +3465,7 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
             if state == "inWar":
                 time_left = _time_left(str(war.get("endTime") or ""))
 
-                # Send at most ONE reminder per loop tick (so it doesn't spam in bursts)
+                                                                                        
                 if "start" not in sent and _can_send("start"):
                     text = (
                         f"🔥 <b>{kind} началась!</b>\n"
@@ -3296,26 +3502,30 @@ async def _broadcast_milestones_loop(bot: Bot, chat_id: int) -> None:
                     war_sent["last_hour"] = now_ts
 
                 if active_id:
-                    # store back
+                                
                     _broadcast_sent[active_id] = war_sent
 
-            # 4) End result
+                           
             if state == "warEnded" or remaining <= 0:
                 if "end" not in sent and _can_send("end", 7 * 24 * 3600):
-                    # Refresh data for final numbers (especially CWL war)
                     final_war = war
                     if kind == "ЛВК" and active_war_tag:
                         fw = await asyncio.to_thread(get_cwl_war, active_war_tag)
                         if isinstance(fw, dict) and not fw.get("_error"):
                             final_war = fw
-                    text = build_war_end_text(final_war or {}, kind=kind)
-                    await _send(text)
+                    text = build_war_end_text(final_war or {}, kind=kind, mention_player=_mention_war_player)
+                    queue_status = await _db_queue_war_notification(active_id or war_id, "end", chat_id, text)
+                    if queue_status in {"pending", "failed"}:
+                        await _deliver_due_war_notifications(bot, chat_id, topic_tid)
+                    elif queue_status is None:
+                        await _send(text)
+                        logger.warning("[WAR] notification_sent_without_outbox war_id=%s kind=%s", active_id or war_id, kind)
                     sent.add("end")
                     if active_id:
                         war_sent["end"] = now_ts
                         _broadcast_sent[active_id] = war_sent
 
-                # After sending end, reset to avoid repeated posts
+                                                                  
                 active_id = None
                 active_kind = None
                 active_war_tag = None
@@ -3361,6 +3571,45 @@ async def http_health(_: web.Request) -> web.Response:
     return web.Response(text="OK", content_type="text/plain")
 
 
+async def http_ready(_: web.Request) -> web.Response:
+    checks = {
+        "startup": _startup_ready,
+        "telegram": _bot_connected,
+        "clash_token": bool(_clash_token),
+        "database": False,
+    }
+    database_error = ""
+    try:
+        if asyncpg is None or not DATABASE_URL:
+            database_error = "database is not configured"
+        else:
+            pool = await _pg_get_pool()
+            async with pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            checks["database"] = True
+    except Exception as exc:
+        database_error = str(exc)
+    ready = all(checks.values())
+    status = 200 if ready else 503
+    payload = {
+        "ok": ready,
+        "checks": checks,
+        "uptime_seconds": int(time.monotonic() - PROCESS_STARTED_AT),
+        "startup_error": _startup_error if not _startup_ready else "",
+    }
+    if database_error:
+        payload["database_error"] = database_error[:180]
+    logger.info("[READY] status=%s checks=%s", status, checks)
+    return web.json_response(payload, status=status)
+
+
+def _rate_limit_response(user: dict) -> web.Response | None:
+    retry_after = _consume_heavy_request(int(user.get("id") or 0))
+    if retry_after:
+        return _json_error(f"Слишком много тяжёлых запросов. Попробуй через {retry_after} сек.", 429)
+    return None
+
+
 async def http_webapp_index(_: web.Request) -> web.StreamResponse:
     index_path = os.path.join(WEBAPP_DIR, "index.html")
     if not os.path.exists(index_path):
@@ -3378,6 +3627,9 @@ async def http_api_lookup(request: web.Request) -> web.Response:
     user = _validate_webapp_init_data(init_data)
     if not user:
         return _json_error("Открой это окно через кнопку в боте и попробуй ещё раз.", 403)
+    limited = _rate_limit_response(user)
+    if limited:
+        return limited
 
     tag = str((payload or {}).get("tag") or "")
     if not validate_tag(tag):
@@ -3449,6 +3701,9 @@ async def http_api_verify(request: web.Request) -> web.Response:
     user = _validate_webapp_init_data(init_data)
     if not user:
         return _json_error("Открой это окно через кнопку в боте и попробуй ещё раз.", 403)
+    limited = _rate_limit_response(user)
+    if limited:
+        return limited
 
     tag = str((payload or {}).get("tag") or "")
     token = str((payload or {}).get("token") or "").strip()
@@ -3485,7 +3740,7 @@ async def http_api_verify(request: web.Request) -> web.Response:
             tg_username=str(user.get("username") or ""),
             tg_first_name=str(user.get("first_name") or ""),
         )
-        # Update cache immediately for mentions
+                                               
         uid = int(user.get("id"))
         tag_n = _norm_tag(tag)
         for cached_tag, cached_uid in list(_links_cache.items()):
@@ -3504,7 +3759,7 @@ async def http_api_verify(request: web.Request) -> web.Response:
         logger.error("DB upsert failed: %s", exc)
         return _json_error("Не удалось сохранить привязку. Попробуй ещё раз.", 502)
 
-    # Notify clan chat (optional)
+                                 
     try:
         if link_changed and _BOT_INSTANCE and isinstance(CHAT_ID, int) and CHAT_ID != 0:
             tg_name = str(user.get("first_name") or "игрок")
@@ -3585,7 +3840,7 @@ async def http_api_unlink(request: web.Request) -> web.Response:
                 _tg_links_cache.pop(uid, None)
                 return web.json_response({"ok": True, "linked": False})
             await conn.execute("DELETE FROM coc_links WHERE telegram_user_id=$1", uid)
-        # update caches
+                       
         try:
             _tg_links_cache.pop(uid, None)
         except Exception:
@@ -3596,7 +3851,7 @@ async def http_api_unlink(request: web.Request) -> web.Response:
             except Exception:
                 pass
 
-        # Notify clan chat
+                          
         try:
             if _BOT_INSTANCE and isinstance(CHAT_ID, int) and CHAT_ID != 0:
                 mention = _mention_html(uid, str(user.get("first_name") or "игрок"))
@@ -3629,6 +3884,7 @@ async def start_render_server() -> web.AppRunner:
     app = web.Application(client_max_size=2 * 1024 * 1024)
     app.router.add_get("/", http_health)
     app.router.add_get("/health", http_health)
+    app.router.add_get("/ready", http_ready)
     app.router.add_get("/webapp", http_webapp_index)
     app.router.add_get("/webapp/", http_webapp_index)
     if os.path.isdir(WEBAPP_DIR):
@@ -3661,7 +3917,7 @@ async def _ensure_registered_for_message(message: Message) -> bool:
     except Exception:
         uid = 0
     if uid <= 0:
-        # Message sent without from_user (e.g. anonymous admin / channel). We can't link it.
+                                                                                            
         await _answer_in_thread(
             message,
             "⚠️ <b>Не вижу, кто отправил команду</b>\n\n"
@@ -3905,7 +4161,7 @@ async def cb_member_profile(query: CallbackQuery) -> None:
     if not await _ensure_registered_for_query(query):
         return
     parts = str(query.data).split(":")
-    # menu:member:<page>:<TAGWITHOUT#>
+                                      
     page = 1
     tag = ""
     if len(parts) >= 4:
@@ -4128,12 +4384,12 @@ async def cb_notify(query: CallbackQuery) -> None:
             "Либо укажи ID группы в <code>CHAT_ID</code> в clash.py, либо нажми кнопку в группе."
         )
         await _edit_or_send(query.message, text, main_menu_keyboard())
-        # stop task started for private chat
+                                            
         _notify_tasks[target_chat_id].cancel()
         _notify_tasks.pop(target_chat_id, None)
         return
 
-    # Quick permission check: try sending a short message once, then delete it to avoid clutter
+                                                                                               
     try:
         test_tid = None
         try:
@@ -4301,7 +4557,7 @@ async def cb_cwl(query: CallbackQuery) -> None:
         w_clan = war.get("clan", {}) or {}
         w_opp = war.get("opponent", {}) or {}
 
-        # Make sure we display score from our perspective even if API returns us in opponent field
+                                                                                                  
         ctag = _norm_tag(w_clan.get("tag"))
         our_side = w_clan if ctag == our_tag else w_opp
         opp_side = w_opp if ctag == our_tag else w_clan
@@ -4388,7 +4644,7 @@ async def cb_cwl_round(query: CallbackQuery) -> None:
         )
         return
 
-    # Reuse war renderer for full details
+                                         
     text = (
         f"🏅 <b>ЛВК — Раунд {round_num}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -4516,6 +4772,58 @@ async def handle_reset(message: Message) -> None:
     asyncio.create_task(_request_safe_restart())
 
 
+@router_dp.message(Command("diagnostic", ignore_mention=True))
+async def handle_diagnostic(message: Message) -> None:
+    if not _is_owner(message):
+        return
+    started = time.perf_counter()
+    db_ok = False
+    db_time = 0.0
+    db_error = ""
+    try:
+        db_started = time.perf_counter()
+        pool = await _pg_get_pool()
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        db_ok = True
+        db_time = time.perf_counter() - db_started
+    except Exception as exc:
+        db_error = str(exc)[:120]
+
+    coc_ok = False
+    coc_time = 0.0
+    coc_error = ""
+    try:
+        coc_started = time.perf_counter()
+        clan = await _api(get_clan_info, CLAN_TAG)
+        coc_time = time.perf_counter() - coc_started
+        coc_ok = isinstance(clan, dict) and not clan.get("_error")
+        if not coc_ok:
+            coc_error = str((clan or {}).get("_error") or "no data")
+    except Exception as exc:
+        coc_error = str(exc)[:120]
+
+    uptime = int(time.monotonic() - PROCESS_STARTED_AT)
+    tasks = sum(1 for task in _notify_tasks.values() if not task.done())
+    text = (
+        "🩺 <b>Диагностика бота</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{'✅' if _bot_connected else '❌'} Telegram: {'подключён' if _bot_connected else 'нет соединения'}\n"
+        f"{'✅' if _clash_token else '❌'} Clash token: {'получен' if _clash_token else 'отсутствует'}\n"
+        f"{'✅' if coc_ok else '❌'} Clash API: {'доступен' if coc_ok else _safe(coc_error or 'недоступен')}"
+        f"{' • ' + f'{coc_time:.2f} сек' if coc_time else ''}\n"
+        f"{'✅' if db_ok else '❌'} Supabase: {'подключена' if db_ok else _safe(db_error or 'недоступна')}"
+        f"{' • ' + f'{db_time:.2f} сек' if db_ok else ''}\n"
+        f"{'✅' if _startup_ready else '⚠️'} Готовность: {'ready' if _startup_ready else _safe(_startup_error)}\n"
+        f"✅ HTTP: <code>/health</code> жив • <code>/ready</code> проверяет зависимости\n"
+        f"✅ Уведомления: активных задач <b>{tasks}</b>\n"
+        f"⏱ Аптайм: <b>{uptime // 3600}ч {(uptime % 3600) // 60}м</b>\n"
+        f"⏱ Диагностика: <b>{time.perf_counter() - started:.2f} сек</b>"
+    )
+    logger.info("[DIAGNOSTIC] owner_id=%s db_ok=%s coc_ok=%s duration=%.3fs", message.from_user.id if message.from_user else 0, db_ok, coc_ok, time.perf_counter() - started)
+    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
+
 async def _request_safe_restart() -> None:
     """Let the active update finish, then enter main()'s graceful cleanup path."""
     global _restart_requested
@@ -4526,7 +4834,7 @@ async def _request_safe_restart() -> None:
     try:
         await router_dp.stop_polling()
     except RuntimeError:
-        # Polling may already be stopping because of a deploy or a network error.
+                                                                                 
         pass
     except Exception as exc:
         logger.warning("Could not stop polling cleanly during restart: %s", exc)
@@ -4924,6 +5232,27 @@ async def handle_new_chat_members(message: Message) -> None:
             logger.warning("Failed to send group nick welcome: %s", exc)
 
 
+@router_dp.chat_member()
+async def handle_chat_member_update(update: ChatMemberUpdated) -> None:
+    chat = getattr(update, "chat", None)
+    if str(getattr(chat, "type", "") or "").lower() not in {"group", "supergroup"}:
+        return
+    new_member = getattr(update, "new_chat_member", None)
+    status = str(getattr(new_member, "status", "") or "").lower()
+    if status not in {"left", "kicked"}:
+        return
+    user = getattr(new_member, "user", None)
+    user_id = int(getattr(user, "id", 0) or 0)
+    chat_id = int(getattr(chat, "id", 0) or 0)
+    if not user_id or not chat_id:
+        return
+    try:
+        if await _db_delete_group_nick(chat_id, user_id):
+            logger.info("[NICKS] removed_on_leave chat_id=%s user_id=%s status=%s", chat_id, user_id, status)
+    except Exception as exc:
+        logger.warning("[NICKS] remove_on_leave_failed chat_id=%s user_id=%s error=%s", chat_id, user_id, exc)
+
+
 @router_dp.message(lambda message: isinstance(getattr(message, "text", None), str) and message.text.strip().lower().startswith("это "))
 async def handle_admin_reply_nick_set(message: Message) -> None:
     """Hidden owner-only reply command for assigning a group nickname to another user."""
@@ -5035,7 +5364,7 @@ async def handle_group_nick_set(message: Message) -> None:
     )
 
 
-@router_dp.message(lambda message: isinstance(getattr(message, "text", None), str) and message.text.strip().lower() == "ники")
+@router_dp.message(lambda message: isinstance(getattr(message, "text", None), str) and message.text.strip().lower() in {"ники", "ники очистить"})
 async def handle_group_nicks_list(message: Message) -> None:
     """Show saved in-game nicknames for the current group."""
     if not _is_group_chat(message):
@@ -5052,6 +5381,39 @@ async def handle_group_nicks_list(message: Message) -> None:
         await _answer_in_thread(
             message,
             "⚠️ Список ников временно недоступен. Попробуй ещё раз чуть позже.",
+            parse_mode="HTML",
+        )
+        return
+
+    command = str(message.text or "").strip().lower()
+    if command == "ники очистить":
+        if not _is_owner(message):
+            await _answer_in_thread(message, "⛔ Очистка списка доступна только владельцу бота.", parse_mode="HTML")
+            return
+        checked = 0
+        removed = 0
+        unresolved = 0
+        for row in rows:
+            user_id = int(row.get("telegram_user_id") or 0)
+            if not user_id:
+                continue
+            checked += 1
+            try:
+                member = await message.bot.get_chat_member(message.chat.id, user_id)
+                status = str(getattr(member, "status", "") or "").lower()
+                if status in {"left", "kicked"} and await _db_delete_group_nick(int(message.chat.id), user_id):
+                    removed += 1
+                    logger.info("[NICKS] removed_by_cleanup chat_id=%s user_id=%s status=%s", message.chat.id, user_id, status)
+            except Exception as exc:
+                unresolved += 1
+                logger.warning("[NICKS] cleanup_check_failed chat_id=%s user_id=%s error=%s", message.chat.id, user_id, exc)
+            await asyncio.sleep(0.05)
+        await _answer_in_thread(
+            message,
+            "🧹 <b>Очистка ников завершена</b>\n\n"
+            f"Проверено: <b>{checked}</b>\n"
+            f"Удалено: <b>{removed}</b>\n"
+            f"Не удалось проверить: <b>{unresolved}</b>",
             parse_mode="HTML",
         )
         return
@@ -5094,7 +5456,7 @@ async def handle_raw_tag(message: Message) -> None:
     raw_tag = message.text.strip().split()[0]
 
     if not validate_tag(raw_tag):
-        return  # Silently ignore invalid tags to avoid spam
+        return                                              
 
     logger.info(
         "User %s sent raw tag %s — auto-looking up player",
@@ -5128,13 +5490,6 @@ async def handle_raw_tag(message: Message) -> None:
     )
 
     await status.edit_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
-
-
-# ============================================================
-# SECTION: MAIN
-# ============================================================
-
-
 async def main() -> None:
     """
     Main entry point for the bot.
@@ -5143,7 +5498,7 @@ async def main() -> None:
     3. Starts the aiogram polling loop.
     """
 
-    # Validate Telegram token
+                             
     if not TELEGRAM_BOT_TOKEN:
         logger.critical(
             "TELEGRAM_BOT_TOKEN не задан. Завершение."
@@ -5161,88 +5516,38 @@ async def main() -> None:
             "CLAN_TAG похож на плейсхолдер. Укажи тег клана в clash.py (CLAN_TAG = '#...')."
         )
 
-    # Retrieve initial API token
-    logger.info("Initializing Clash of Clans API token...")
-    get_clash_token()
-    logger.info("Клан по умолчанию: %s", CLAN_TAG)
-    try:
-        clan = get_clan_info(CLAN_TAG)
-        if isinstance(clan, dict) and not clan.get("_error"):
-            cname = str(clan.get("name") or "").strip()
-            global _CLAN_NAME_CACHED
-            if cname:
-                _CLAN_NAME_CACHED = cname
-    except Exception:
-        pass
-
-    # Initialize bot instance early (used by WebApp verification handler for announcements)
+    global _startup_ready, _startup_error, _bot_connected, _CLAN_NAME_CACHED
     token_prefix = (TELEGRAM_BOT_TOKEN.split(":", 1)[0] if TELEGRAM_BOT_TOKEN else "—")
-    logger.info("Telegram token prefix (bot id): %s", token_prefix)
+    logger.info("[STARTUP] creating_bot bot_id=%s", token_prefix)
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     global _BOT_INSTANCE
     _BOT_INSTANCE = bot
     global _BOT_USERNAME
-    try:
-        me = await bot.get_me()
-        _BOT_USERNAME = str(getattr(me, "username", "") or "").strip()
-        try:
-            actual_id = str(getattr(me, "id", "") or "")
-            if token_prefix and token_prefix != "—" and actual_id and token_prefix != actual_id:
-                logger.warning(
-                    "Telegram token prefix does not match getMe() id (%s != %s). "
-                    "Check Render env TELEGRAM_BOT_TOKEN / hardcoded token.",
-                    token_prefix,
-                    actual_id,
-                )
-        except Exception:
-            pass
-    except Exception:
-        _BOT_USERNAME = ""
     dp = router_dp
 
-    # Render web server (binds to $PORT): health-check + Telegram Mini App.
     server_runner = await start_render_server()
+    logger.info("[RENDER] server_ready port=%s", os.environ.get("PORT", "10000"))
 
-    # Show public URL in logs (useful to paste into BotFather / UI)
     try:
         public_url = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
         if not public_url:
             public_url = (PUBLIC_BASE_URL or "").strip().rstrip("/")
-        logger.info("Web URL: %s", public_url or "—")
+        logger.info("[RENDER] public_url=%s", public_url or "—")
         if public_url:
-            logger.info("Mini App URL: %s/webapp", public_url)
+            logger.info("[RENDER] miniapp_url=%s/webapp", public_url)
     except Exception:
         pass
 
-    # Prepare DB for Mini App links (Supabase)
     try:
         await _pg_ensure_schema()
         await _refresh_links_cache(force=True)
         await _refresh_tg_links_cache(force=True)
-        logger.info("Supabase: connected")
+        logger.info("[DB] connected")
     except Exception as exc:
-        logger.warning("Supabase: not connected (%s)", exc)
+        logger.warning("[DB] unavailable error=%s", exc)
 
-    # Prevent Telegram polling conflicts during deploy overlap (best-effort).
     try:
         await _acquire_polling_lock()
-    except Exception:
-        pass
-
-    # Auto notifications for clan chat (4 milestone messages per war)
-    try:
-        if isinstance(CHAT_ID, int) and CHAT_ID != 0:
-            if CHAT_ID not in _notify_tasks or _notify_tasks[CHAT_ID].done():
-                # Verify that bot can access the chat (avoid noisy "chat not found" loops)
-                try:
-                    await bot.get_chat(CHAT_ID)
-                    # Prime a group menu message so the bot is usable in groups even with Privacy Mode on.
-                    # (Users can always interact via inline callbacks from this message.)
-                    await _prime_group_menu(bot)
-                    _notify_tasks[CHAT_ID] = asyncio.create_task(_broadcast_milestones_loop(bot, CHAT_ID))
-                    logger.info("Auto notifications enabled for chat %s", CHAT_ID)
-                except Exception as exc:
-                    logger.warning("Auto notifications disabled: cannot access chat %s (%s)", CHAT_ID, exc)
     except Exception:
         pass
 
@@ -5257,12 +5562,13 @@ async def main() -> None:
             loop.add_signal_handler(signal.SIGTERM, _shutdown)
             loop.add_signal_handler(signal.SIGINT, _shutdown)
         except Exception:
-            # Signal handlers may be unsupported on Windows
+                                                           
             pass
 
-        # Ensure token is valid early (otherwise polling will loop forever with Unauthorized)
         try:
-            await bot.get_me()
+            me = await bot.get_me()
+            _bot_connected = True
+            _BOT_USERNAME = str(getattr(me, "username", "") or "").strip()
         except TelegramUnauthorizedError as exc:
             logger.critical(
                 "Telegram Unauthorized: токен бота неверный или был сброшен в BotFather. (%s)",
@@ -5270,22 +5576,44 @@ async def main() -> None:
             )
             sys.exit(1)
 
-        # Ensure no webhook is set (polling only)
         try:
-            # Do not discard commands while Render replaces an instance during a
-            # deploy or after /reset.  The advisory lock prevents two pollers.
             await bot.delete_webhook(drop_pending_updates=False)
         except Exception:
             pass
 
-        logger.info("Starting Clash of Clans Telegram bot in polling mode (Render-ready)...")
-        logger.info("Bot is ready. Listening for messages...")
+        try:
+            logger.info("[STARTUP] initializing_clash_api clan_tag=%s", CLAN_TAG)
+            await _api(get_clash_token)
+            clan = await _api(get_clan_info, CLAN_TAG)
+            if not isinstance(clan, dict) or clan.get("_error"):
+                raise RuntimeError(str((clan or {}).get("_error") or "clan data unavailable"))
+            cname = str(clan.get("name") or "").strip()
+            if cname:
+                _CLAN_NAME_CACHED = cname
+            _startup_ready = True
+            _startup_error = ""
+            logger.info("[STARTUP] ready clan=%s", cname or CLAN_TAG)
+        except Exception as exc:
+            _startup_ready = False
+            _startup_error = f"Clash API: {exc}"[:180]
+            logger.warning("[STARTUP] clash_api_unavailable error=%s", exc)
+
+        try:
+            if isinstance(CHAT_ID, int) and CHAT_ID != 0:
+                await bot.get_chat(CHAT_ID)
+                await _prime_group_menu(bot)
+                _notify_tasks[CHAT_ID] = asyncio.create_task(_broadcast_milestones_loop(bot, CHAT_ID))
+                logger.info("[WAR] notifications_enabled chat_id=%s", CHAT_ID)
+        except Exception as exc:
+            logger.warning("[WAR] notifications_disabled chat_id=%s error=%s", CHAT_ID, exc)
+
+        logger.info("[STARTUP] polling_started")
 
         while not SHUTDOWN_EVENT.is_set():
             try:
                 await dp.start_polling(
                     bot,
-                    allowed_updates=["message", "callback_query"],
+                    allowed_updates=["message", "callback_query", "chat_member"],
                     drop_pending_updates=False,
                 )
                 if not SHUTDOWN_EVENT.is_set():
@@ -5301,7 +5629,7 @@ async def main() -> None:
             except TelegramConflictError as exc:
                 if SHUTDOWN_EVENT.is_set():
                     break
-                # Usually happens when another instance is still polling (e.g. during Render deploy overlap).
+                                                                                                             
                 logger.warning(
                     "Telegram Conflict (getUpdates already used elsewhere). "
                     "Жду 60 секунд и пробую снова. (%s)",
@@ -5340,8 +5668,8 @@ async def main() -> None:
         await bot.session.close()
         logger.info("Bot session closed.")
         if _restart_requested:
-            # A non-zero exit tells Render to create a new process.  This is
-            # deliberately after server, DB, lock and Telegram cleanup.
+                                                                            
+                                                                       
             logger.warning("Graceful cleanup completed; exiting for Render restart.")
             raise SystemExit(75)
 
